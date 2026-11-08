@@ -82,6 +82,8 @@
 #include "kern_tgl_submit_history.hpp"
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
+#include "kern_tgl_encode_guard.hpp"
+#include "kern_tgl_reset_trace.hpp"
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -296,6 +298,7 @@ void XE::tglRecordStartOrder(unsigned stage,void *object,unsigned ddi,
 
 
 // Exact donor parameter, initialized by its C++ constructor before start().
+static bool tglEncodeGuardReady;
 static uint64_t *tglBlitScratchSize;
 static uint64_t tglPPGTTClass;
 static uintptr_t tglExtendedBufferReturn;
@@ -309,31 +312,80 @@ static bool tglBlitDeferredSerialize(void *,void *,OSSerialize *serializer) {
 
 namespace {
 uint32_t tglRecoveryCalls {}, tglRecoveryReturns {};
-uint64_t tglRecoveryRecords[16][16] {};
+// Record schema 125: 32 qwords, ready flag in q[31].
+constexpr unsigned tglRecoveryWords=32;
+uint64_t tglRecoveryRecords[16][tglRecoveryWords] {};
+// Render-domain recovery (RCS+CCS share GDRST mask 2). Native lists are filled
+// by donor static constructors, so the merged list is built at first reset.
+TGLRecovery::Domain tglRecoveryDomain;
+TGLRecovery::ForceWake tglRecoveryForceWake {};
+TGLRecovery::SubmitStamp tglRecoverySubmitStamp {};
+bool tglRecoveryDomainTried {false};
+TGLResetTrace::Ring tglResetTrace;
+inline uint64_t tglTraceNow() { uint64_t t {};clock_get_uptime(&t);return t; }
+bool tglResetTraceSerialize(void *,void *,OSSerialize *serializer) {
+	// Header: schema, next sequence, capacity, words. Built in the OSData.
+	const uint64_t head[4] {1,__atomic_load_n(&tglResetTrace.next,__ATOMIC_ACQUIRE),
+		TGLResetTrace::capacity,TGLResetTrace::words};
+	auto out=OSData::withCapacity(sizeof(head)+sizeof(tglResetTrace.record));if (!out) return false;
+	bool ok=out->appendBytes(head,sizeof(head)) && out->appendBytes(tglResetTrace.record,sizeof(tglResetTrace.record));
+	ok=ok && out->serialize(serializer);out->release();return ok;
+}
 bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
-	uint64_t data[2+16*16] {};
-	data[0]=__atomic_load_n(&tglRecoveryCalls,__ATOMIC_ACQUIRE);
-	data[1]=__atomic_load_n(&tglRecoveryReturns,__ATOMIC_ACQUIRE);
-	for (unsigned i=0;i<16;++i) {
-		if (__atomic_load_n(&tglRecoveryRecords[i][15],__ATOMIC_ACQUIRE))
-			memcpy(data+2+i*16,tglRecoveryRecords[i],sizeof(tglRecoveryRecords[i]));
+	// Built in the OSData, not on the kernel stack (boot-stack budget).
+	const uint64_t head[2] {__atomic_load_n(&tglRecoveryCalls,__ATOMIC_ACQUIRE),
+		__atomic_load_n(&tglRecoveryReturns,__ATOMIC_ACQUIRE)};
+	auto out=OSData::withCapacity(sizeof(head)+sizeof(tglRecoveryRecords));if (!out) return false;
+	bool ok=out->appendBytes(head,sizeof(head));
+	static const uint64_t empty[tglRecoveryWords] {};
+	for (unsigned i=0;ok && i<16;++i) {
+		const bool ready=__atomic_load_n(&tglRecoveryRecords[i][tglRecoveryWords-1],__ATOMIC_ACQUIRE);
+		ok=out->appendBytes(ready ? tglRecoveryRecords[i] : empty,sizeof(tglRecoveryRecords[i]));
 	}
-	auto out=OSData::withBytes(data,sizeof(data));if (!out) return false;
-	const bool ok=out->serialize(serializer);out->release();return ok;
+	ok=ok && out->serialize(serializer);out->release();return ok;
 }
 }
 
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
-	const auto result=TGLRecovery::resetAndResume(channel);
+	{
+		// Trace the streamer of the ring being recovered (aux = channel index).
+		void *ring=TGLRecovery::field<void *>(channel,0x130);
+		void *sched=TGLRecovery::field<void *>(TGLRecovery::field<void *>(channel,0x18),0x1250);
+		const uint8_t type=TGLRecovery::field<uint8_t>(ring,0x40);
+		void *ctx=TGLRecovery::field<void *>(ring,0x20);
+		void *ch=ctx ? TGLRecovery::field<void *>(ctx,0xB8) : nullptr;
+		if (sched && type<=1) TGLResetTrace::record(tglResetTrace,before,TGLResetTrace::Recovery,
+			TGLRecovery::field<void *>(sched,0xCA0+type*8u),ch ? TGLRecovery::field<uint32_t>(ch,0x20) : UINT32_MAX,n+1);
+	}
+	if (!tglRecoveryDomainTried && tglRecoveryDomain.native[0]) {
+		// Recovery runs serialized on the accelerator work loop.
+		tglRecoveryDomainTried=true;
+		if (!TGLRecovery::build(tglRecoveryDomain))
+			SYSLOG("igfx","TGL render-domain reset list unavailable; native single-ring restore kept");
+	}
+	const auto result=TGLRecovery::resetAndResume(channel,&tglRecoveryDomain,tglRecoveryForceWake,
+		tglRecoverySubmitStamp);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
-		auto q=tglRecoveryRecords[n];q[0]=123;q[1]=n+1;q[2]=before;q[3]=after;
+		auto q=tglRecoveryRecords[n];q[0]=125;q[1]=n+1;q[2]=before;q[3]=after;
 		q[4]=reinterpret_cast<uintptr_t>(channel);q[5]=result.ring;
 		q[6]=result.context;q[7]=result.affected;q[8]=result.index;
 		q[9]=result.failuresBefore;q[10]=result.failuresAfter;q[11]=result.resetOK;
-		__atomic_store_n(&q[15],1,__ATOMIC_RELEASE);
+		q[12]=result.type|static_cast<uint64_t>(result.siblingType)<<8;
+		q[13]=result.domainList|static_cast<uint64_t>(result.siblingReset)<<1;
+		q[14]=tglRecoveryDomain.ready ? tglRecoveryDomain.merged.count : 0;
+		q[15]=result.siblingIndex|static_cast<uint64_t>(result.stampsAppended)<<32;
+		// Per engine (RCS q16..22, CCS q23..29): port, then for each port/element
+		// (present<<63 | flags<<32 | stamp).
+		for (unsigned t=0;t<2;++t) {
+			const auto &s=result.ports[t];auto w=q+16+t*7;w[0]=s.port;
+			for (unsigned p=0;p<2;++p) for (unsigned e=0;e<2;++e)
+				if (1+p*2+e<7) w[1+p*2+e]=(static_cast<uint64_t>(s.present[p][e])<<63)|
+					(static_cast<uint64_t>(s.flags[p][e]&0x7FFFFFFF)<<32)|s.stamp[p][e];
+		}
+		__atomic_store_n(&q[tglRecoveryWords-1],1,__ATOMIC_RELEASE);
 	}
 	__atomic_fetch_add(&tglRecoveryReturns,1,__ATOMIC_RELEASE);
 }
@@ -11297,6 +11349,57 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+// Hardware encode admission (see kern_tgl_encode_guard.hpp). Counters are
+// relaxed statistics only; rejection never depends on them.
+namespace {
+uint32_t tglEncodeRejected[TGLEncodeGuard::Count] {};
+bool tglEncodeLogged {};
+bool tglEncodeGuardSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t q[1+TGLEncodeGuard::Count] {1};
+ for(uint32_t i=0;i<TGLEncodeGuard::Count;++i)q[1+i]=__atomic_load_n(&tglEncodeRejected[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+template<TGLEncodeGuard::Path P> void tglEncodeReject(void *,void *info) {
+ TGLEncodeGuard::reject(info);
+ __atomic_fetch_add(&tglEncodeRejected[P],1,__ATOMIC_RELAXED);
+ bool expected=false;
+ if(__atomic_compare_exchange_n(&tglEncodeLogged,&expected,true,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))
+  SYSLOG("igfx","TGL hardware encode stream rejected (path %u); use -wex-tgl-hwenc to allow",static_cast<unsigned>(P));
+}
+// Returns true when encode is either explicitly allowed or fully guarded.
+// A partial install is impossible: every site is qualified before any route.
+bool tglInstallEncodeGuard(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(checkKernelArgument("-wex-tgl-hwenc")) {root->setProperty("TGLHardwareEncode","allowed");return true;}
+ const auto base=reinterpret_cast<const uint8_t *>(address);
+ bool ready=true;
+ for(uint32_t i=0;i<TGLEncodeGuard::Count;++i) {
+  const auto &site=TGLEncodeGuard::sites[i];
+  const auto solved=patcher.solveSymbol<mach_vm_address_t>(index,site.symbol,address,size);
+  patcher.clearError();
+  ready=ready && TGLEncodeGuard::qualify(static_cast<TGLEncodeGuard::Path>(i),base,size,solved);
+ }
+ if(ready) {
+  using namespace TGLEncodeGuard;
+  KernelPatcher::RouteRequest routes[] {
+   {sites[EncodingCommon].symbol,tglEncodeReject<EncodingCommon>},
+   {sites[MediaKernel].symbol,tglEncodeReject<MediaKernel>},
+   {sites[VDENC].symbol,tglEncodeReject<VDENC>},
+   {sites[AVCPAK].symbol,tglEncodeReject<AVCPAK>},
+  };
+  ready=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+  patcher.clearError();
+ }
+ root->setProperty("TGLHardwareEncode",ready ? "guarded" : "guard-unavailable");
+ if(ready)if(auto live=OSSerializer::forTarget(nullptr,tglEncodeGuardSerialize)) {
+  root->setProperty("TGLEncodeGuardLive",live);live->release();
+ }
+ if(!ready)SYSLOG("igfx","TGL hardware encode guard unavailable: donor image does not match");
+ return ready;
+}
+}
+
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
  // Framebuffer-only mode must never enter the donor accelerator probe.
@@ -11315,6 +11418,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  }
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
+ tglEncodeGuardReady=tglInstallEncodeGuard(patcher,index,address,size);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
@@ -12206,6 +12310,51 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				if (recoveryOK) if (auto live=OSSerializer::forTarget(nullptr,tglRecoverySerialize)) {
 					IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryLive",live);live->release();
 				}
+				if (recoveryOK) if (auto trace=OSSerializer::forTarget(nullptr,tglResetTraceSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLResetTrace",trace);trace->release();
+				}
+				// Render-domain restore: exact donor list objects and the native
+				// forcewake used by resetGraphicsEngine. Any mismatch keeps the
+				// single-ring native restore (domain stays unused).
+				bool domainOK=false;
+				if (recoveryOK) {
+					const auto rcs=patcher.solveSymbol<mach_vm_address_t>(index,"_rcsResetRegisters",address,size);
+					const auto ccs=patcher.solveSymbol<mach_vm_address_t>(index,"_ccsResetRegisters",address,size);
+					const auto wake=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size);
+					const uint8_t mainList[] {0x48,0x8D,0x05}, computeList[] {0x48,0x8D,0x05};
+					domainOK=rcs==address+0x14B2B0 && ccs==address+0x14AEB8 && wake==address+0x28C2A &&
+						size>0x84D4B && !memcmp(reinterpret_cast<void *>(address+0x84D40),mainList,sizeof(mainList)) &&
+						!memcmp(reinterpret_cast<void *>(address+0x4E38D),computeList,sizeof(computeList)) &&
+						*reinterpret_cast<uint32_t *>(address+0x84D3C)==TGLRecovery::renderDomainMask &&
+						*reinterpret_cast<uint32_t *>(address+0x4E389)==TGLRecovery::renderDomainMask;
+					patcher.clearError();
+					if (domainOK) {
+						tglRecoveryDomain.native[0]=reinterpret_cast<const TGLRecovery::ResetList *>(rcs);
+						tglRecoveryDomain.native[1]=reinterpret_cast<const TGLRecovery::ResetList *>(ccs);
+						tglRecoveryForceWake=reinterpret_cast<TGLRecovery::ForceWake>(wake);
+					}
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryRenderDomainReady",domainOK);
+				// Native completion stamp (resetHardwareAndReplay 4CA79..4CA97):
+				// owner(+18)->events(+380)->vtable1D8(index +20), then
+				// submitStampCommand. Qualify the exact sequence and callee.
+				bool stampOK=false;
+				if (recoveryOK) {
+					const auto stamp=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18IGAccelFIFOChannel18submitStampCommandEv",address,size);
+					const uint8_t sequence[] {0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x80,0x03,0x00,0x00,0x8B,0x73,0x20,
+						0x48,0x8B,0x07,0xFF,0x90,0xD8,0x01,0x00,0x00,0x48,0x89,0xDF,0xE8};
+					const uint8_t prologue[] {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x10,0x48,0x8B,0x47,0x18};
+					stampOK=stamp==address+0x4C506 && size>0x4CA98 &&
+						!memcmp(reinterpret_cast<void *>(address+0x4CA79),sequence,sizeof(sequence)) &&
+						!memcmp(reinterpret_cast<void *>(address+0x4C506),prologue,sizeof(prologue));
+					if (stampOK) {
+						int32_t rel {};memcpy(&rel,reinterpret_cast<void *>(address+0x4CA94),sizeof(rel));
+						stampOK=static_cast<mach_vm_address_t>(static_cast<int64_t>(address+0x4CA98)+rel)==stamp;
+					}
+					patcher.clearError();
+					if (stampOK) tglRecoverySubmitStamp=reinterpret_cast<TGLRecovery::SubmitStamp>(stamp);
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryCompletionStampReady",stampOK);
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassReady",recoveryRequested && recoveryOK);
@@ -14334,6 +14483,15 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
 
+	// Without -wex-tgl-hwenc, hardware encode is refused in the kernel (see
+	// tglInstallEncodeGuard). Also withdraw the HEVC encode capability and mark
+	// the H.264 encoder restricted for VideoToolbox. Decode keys (IOGVACodec,
+	// HEVC decode, scaler, BGRA) remain; the kernel guard is authoritative.
+	if (!checkKernelArgument("-wex-tgl-hwenc")) {
+		that->removeProperty("IOGVAHEVCEncodeCapabilities");
+		that->setProperty("IOGVAEncoderRestricted", true);
+	}
+
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
 		SYSLOG("igfx", "TGL blit scratch parameter mismatch");
 		return false;
@@ -15206,8 +15364,10 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
 }
 void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
 void XE::wrapTGLCSBReset(void *streamer) {
+ TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::ResetBefore,streamer,0,0);
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+ TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::ResetAfter,streamer,0,0);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
@@ -15261,7 +15421,11 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
     tglHostCSBFatal("ElementSwitch-second-item-null",words);
    }
   }
+  TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::CSBBefore,streamer,
+   handler|static_cast<uint32_t>(event.kind)<<8|sample.index<<16,sample.raw);
   tglCSBMethods[handler](streamer,&entry);
+  TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::CSBAfter,streamer,
+   handler|static_cast<uint32_t>(event.kind)<<8|sample.index<<16,sample.raw);
   if (record) {
    // Existing fixed history: native return and resulting banks, no MMIO/wait.
    uint64_t banks[12];tglHostBanks(io.streamer,banks);
@@ -16057,7 +16221,9 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    reinterpret_cast<uint64_t>(streamer),tglCSBEngines[0].resets,read,force);
  } else if(tglSameTailEnabled && streamer==tglCSBEngines[0].streamer)tglSameTailState.previous={};
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,0);
+ TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::SubmitBefore,streamer,flags,0);
  FunctionCast(wrapTGLHostSubmit,callbackXE->orgTGLHostSubmit)(streamer,flags);
+ TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::SubmitAfter,streamer,flags,0);
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,1);
  adlnQueueTraceSubmitFinish(queueTraceMask,renderWakeOwner);
  if(executionSlot!=UINT32_MAX) {

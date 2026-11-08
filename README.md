@@ -78,6 +78,10 @@ If it is fixed at **60MB**, also add `-igfxdvmt` and set these iGPU properties u
 
 These settings are unnecessary at 96MB and do not increase firmware-allocated memory.
 
+### Optional boot arguments
+
+- `-wex-tgl-hwenc`: allow Tiger Lake hardware video encode (VideoToolbox H.264). It is refused by default; see [known issues](#known-issues-and-limits).
+
 ### Other settings
 
 - Add `SSDT-PNLF` for internal-display brightness control.
@@ -86,7 +90,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 
 ## Tested features and known issues
 
-The common regression checks cover Metal, OpenGL, OpenCL, hardware H.264 encode/decode and HEVC decode. The table summarizes OS coverage and configuration-specific display features.
+The common regression checks cover Metal, OpenGL, OpenCL, hardware H.264 decode and HEVC decode; Tiger Lake hardware encode requires `-wex-tgl-hwenc`. The table summarizes OS coverage and configuration-specific display features.
 
 | Configuration | Verified coverage |
 | --- | --- |
@@ -106,6 +110,7 @@ System sleep/wake support is **experimental**. Tested configurations are MiniBoo
 
 - DisplayPort reconnection can cause black screens or freezes. Tiger Lake USB-C reconnection is also unreliable; Alder Lake-S DP output/reconnection can be slow.
 - Some image-conversion operations can crash applications; App Store video can freeze the GPU on Sequoia.
+- Tiger Lake hardware video encode is disabled by default: on some configurations it hangs the GPU in a way that cannot be recovered and freezes the desktop. Hardware encode requests fail (for example, an export reports that it cannot encode) instead of falling back to software, because macOS still selects the hardware encoder on SMBIOS models that list it. Use an application's software encoder (such as x264) where available. Hardware decode is unaffected. Add `-wex-tgl-hwenc` to re-enable it.
 - Safari video may occasionally drop frames. FairPlay-protected playback is unsupported.
 - Up to three displays are supported. Resolutions beyond the tested configurations remain unverified.
 - Some connector layouts and backlight methods, MST and Thunderbolt-managed outputs are unsupported.

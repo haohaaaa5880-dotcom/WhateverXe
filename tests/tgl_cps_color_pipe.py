@@ -51,7 +51,7 @@ int main(int argc,char**argv){
  uint8_t owner[0x1500]={},task[0x300]={},manager[0x100]={},ctx[0x100]={};void *link[3]={manager,nullptr,nullptr};
  put(owner,0x150,task);put(owner,0x1260,manager);put(task,0x10,owner);put(task,0x268,link);put(manager,0x98,manager);expectedTask=task;put(ctx,0x50,owner);
  memset(page,0xA5,sizeof(page));assert(tglCPSPrepare(owner));assert(allocations==1&&released==0);
- const uint32_t payload[]={0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000,0x05000000};assert(!memcmp(page,payload,sizeof(payload)));
+ const uint32_t payload[]={0,0x1100000F,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x41004100,0x2580,0x00060002,0x7018,0x20002000,0x7300,0x00400040,0x20EC,0x00020002,0xE18C,0x80008000,0x05000000};assert(!memcmp(page,payload,sizeof(payload)));
  for(unsigned i=sizeof(payload);i<4096;++i)assert(page[i]==0);
  for(unsigned i=4096;i<8192;++i)assert(page[i]==0xA5);
  assert(*(void**)(owner+0x13f8)==buffer);assert(tglCPSCounts[2]==addr&&tglCPSCounts[3]==(addr|5));
@@ -85,8 +85,9 @@ int main(int argc,char**argv){
  printf("Native safe clone size0x%x: pointer reinstated, all other bytes preserved; reset/unknown callers unchanged\n",imageSize);
 
  for(uint32_t old:{0U,0x800U,0xffffU}){auto word=payload[3],mask=word>>16;assert(((old&~mask)|(word&mask))==(old|0x200));}
- assert((payload[1]&0xff)+2==7 && payload[8]==0x05000000); // 3 LRI pairs + batch end
- for(uint32_t old=0;old<65536;++old){auto word=payload[7],mask=word>>16;assert(((old&~mask)|(word&mask))==(old|0x4000));}
+ assert((payload[1]&0xff)+2==17 && payload[18]==0x05000000); // 8 LRI pairs + batch end
+ for(uint32_t old=0;old<65536;++old){auto word=payload[7],mask=word>>16;assert(((old&~mask)|(word&mask))==(old|0x4100));}
+ for(uint32_t old=0;old<65536;++old){auto word=payload[9],mask=word>>16;assert(((old&~mask)|(word&mask))==((old&~6U)|2U));}
  tglContextCacheEnabled=true;put(owner,0x13f8,nullptr);memset(page,0xA5,sizeof(page));assert(tglCPSPrepare(owner));
  assert(!memcmp(page,payload,sizeof(payload)));const uint32_t indirect[]={0x11000001,0x20D8,0x00400040};
  assert(!memcmp(page+4096,indirect,sizeof(indirect)));for(unsigned i=4108;i<8192;++i)assert(!page[i]);

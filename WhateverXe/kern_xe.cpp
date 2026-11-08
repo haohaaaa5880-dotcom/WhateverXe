@@ -566,8 +566,22 @@ static bool tglCPSPrepare(void *owner) {
  // complete TGL timer value after every context restore; no read/modify/write.
  // r160: Wa_1606931601, masked EU early-read disable. Existing multicast
  // steering is retained; this adds no CPU MMIO write or synchronization wait.
- const uint32_t batch[] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000,0x05000000};
- bzero(cpu,extent);memcpy(cpu,batch,sizeof(batch));
+ // Linux gen12/TGL render workarounds the donor sets only conditionally, on
+ // other bits, or by a one-time MMIO write (all masked, re-applied on every
+ // RCS context restore so GDRST and RC6 cannot drop them):
+ //  E4F4 bit8  Wa_1409804808 PUSH_CONST_DEREF_HOLD_DIS (with bit14 above)
+ //  2580 [2:1]=01 WaDisableGPGPUMidThreadPreemption:gen12 (thread-group level)
+ //  7018 bit13 Wa_1806527549 HZ_DEPTH_TEST_LE_GE_OPT_DISABLE
+ //  7300 bit6  Wa_1606376872 DISABLE_TDC_LOAD_BALANCING_CALC
+ //  20EC bit1  Wa_1606700617/22010271021/14010826681 FF_DOP_CLOCK_GATE_DISABLE
+ //  E18C bit15 Wa_1406941453 ENABLE_SMALLPL
+ const uint32_t batch[] {0,0x1100000F,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x41004100,
+  0x2580,0x00060002,0x7018,0x20002000,0x7300,0x00400040,0x20EC,0x00020002,0xE18C,0x80008000,0x05000000};
+ // -wex-tgl-no-ctxwa keeps the previous three-register batch.
+ static const uint32_t legacy[] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000,0x05000000};
+ const bool reduced=checkKernelArgument("-wex-tgl-no-ctxwa");
+ bzero(cpu,extent);
+ if(reduced)memcpy(cpu,legacy,sizeof(legacy));else memcpy(cpu,batch,sizeof(batch));
  if(tglContextCacheEnabled)TGLContextCache::batch(cpu);
  // Publish CPU writes before first GPU use, independent of LLC policy.
  for(unsigned i=0;i<extent;i+=64)asm volatile("clflush (%0)"::"r"(cpu+i):"memory");

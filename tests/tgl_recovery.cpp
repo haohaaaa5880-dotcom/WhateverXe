@@ -101,6 +101,7 @@ void buildCases() {
 	// RING_PSMI_CTL wait-for-event workaround, masked, on both render-domain engines;
 	// the CCS copy follows the RCU_MODE CCS enable.
 	assert(at(0x2050)>0 && d.storage[at(0x2050)].masked==1);
+	assert(at(0x20B4)>0 && !d.storage[at(0x20B4)].masked); // RCS EMR
 	assert(at(0x1A050)>at(0x14800) && d.storage[at(0x1A050)].masked==1);
 	bool imr=false;
 	for (uint64_t i=0;i<d.merged.count;++i) {

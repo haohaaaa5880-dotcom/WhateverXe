@@ -51,8 +51,9 @@ struct Extra { uint32_t reg; bool masked; };
 // power down inside MI_WAIT_FOR_EVENT and miss the display scanline event,
 // so WindowServer's scanline waits never complete and every later reset
 // recurs (live captures run-104625/run-110954, upstream #44/#62).
+// RCS EMR (20B4) is also lost (FFFFFFFA -> FFFFFFFF in run-112942 reports).
 inline constexpr Extra domainExtras[] {
-	{0x14800,true},{0x2050,true},
+	{0x14800,true},{0x2050,true},{0x20B4,false},
 	{0x24D8,false},{0x24DC,false},{0x24E0,false},{0x24F0,false},{0x24F4,false},{0x24F8,false},{0x24FC,false}
 };
 // CCS engine registers at the same offsets the native RCS list restores for

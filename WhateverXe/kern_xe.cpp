@@ -324,6 +324,7 @@ TGLRecovery::ForceWake tglRecoveryForceWake {};
 TGLRecovery::SubmitStamp tglRecoverySubmitStamp {};
 bool tglRecoveryDomainTried {false};
 TGLResetTrace::Ring tglResetTrace;
+bool tglDisplaySyncSerialize(void *,void *,OSSerialize *serializer);
 inline uint64_t tglTraceNow() { uint64_t t {};clock_get_uptime(&t);return t; }
 bool tglResetTraceSerialize(void *,void *,OSSerialize *serializer) {
 	// Header: schema, next sequence, capacity, words. Built in the OSData.
@@ -12350,6 +12351,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				if (recoveryOK) if (auto trace=OSSerializer::forTarget(nullptr,tglResetTraceSerialize)) {
 					IORegistryEntry::getRegistryRoot()->setProperty("TGLResetTrace",trace);trace->release();
 				}
+				if (recoveryOK) if (auto display=OSSerializer::forTarget(nullptr,tglDisplaySyncSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplaySyncLive",display);display->release();
+				}
 				// Render-domain restore: exact donor list objects and the native
 				// forcewake used by resetGraphicsEngine. Any mismatch keeps the
 				// single-ring native restore (domain stays unused).
@@ -15277,6 +15281,32 @@ void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
+}
+
+// Read-only display-side state for RCS scanline waits (WAIT_ON_SCANLINE stalls).
+// Display registers need no GT forcewake. Only pipe A (the internal panel,
+// powered while the screen is on) is read; DE_RRMR's unmasked bit tells which
+// pipe a pending MI_WAIT_FOR_EVENT targets (bit0 A, bit8 B, bit14 C), so a
+// wait on B or C is identified without touching an unpowered power well.
+// Schema 1: [uptime, ready, DE_RRMR, PIPEDSL_A x2, PIPE_FRMCNT_A x2, TRANSCONF_A,
+//            PIPESRC_A, gap ns]. Two DSL/FRMCNT samples 200 us apart show
+// whether pipe A is actually scanning.
+bool tglDisplaySyncSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[10] {};clock_get_uptime(&q[0]);
+ auto owner=static_cast<uint8_t *>(tglHost.owner);
+ auto bar=owner ? *reinterpret_cast<volatile uint8_t **>(owner+0x1240) : nullptr;
+ if (bar && tglHost.barSize>=0x80000) {
+  auto rd=[&](uint32_t r){return static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(bar+r));};
+  q[1]=1;q[2]=rd(0x44050);
+  uint64_t t0 {},t1 {};clock_get_uptime(&t0);
+  q[3]=rd(0x70000);q[5]=rd(0x70040);
+  IODelay(200);
+  q[4]=rd(0x70000);q[6]=rd(0x70040);clock_get_uptime(&t1);
+  q[7]=rd(0x70008);q[8]=rd(0x6001C);
+  absolutetime_to_nanoseconds(t1-t0,&q[9]);
+ }
+ auto out=OSData::withBytes(q,sizeof(q));if(!out)return false;
+ const bool ok=out->serialize(serializer);out->release();return ok;
 }
 
 bool tglCSBModeSerialize(void *,void *,OSSerialize *serializer) {

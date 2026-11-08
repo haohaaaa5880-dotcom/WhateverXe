@@ -11403,6 +11403,40 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+// Metal graphics contexts are created from g_cInitGfxHwCtxParamsForGraphics,
+// whose flags byte 0x1C includes 0x10: pair the RCS context with a POCS
+// (position-only shading) context. The donor tells user space POSH is off
+// (_kIntelSharedExFtrPoshEnable = 0), GL/compute/video contexts use 0x0C, and
+// Linux never enables POSH on Gen12 LP. Every RCS hang captured on this
+// machine is such a paired context, stalled with its ring fully consumed
+// and both RCS and POCS not done. Clear 0x10 in both copies (one per
+// translation unit) so graphics contexts match the GL ones. Opt-out:
+// -wex-tgl-posh. Exact bytes and every lea that loads them are checked first.
+static int tglPOSHOffState=-1; // -1 not tried, 0 kept (opt-out or mismatch), 1 off
+static void tglInstallPOSHOff(KernelPatcher &patcher,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-posh")) { tglPOSHOffState=0;root->setProperty("TGLPOSHOff",false);return; }
+ static const uint8_t before[12] {0,0,0x1C,0,0,0,0,0,0,0,0,0}, after[12] {0,0,0x0C,0,0,0,0,0,0,0,0,0};
+ constexpr uint32_t copies[2] {0xB09A4,0xB0BC0}, loads[3] {0x25D95,0x25DB9,0x2FD76};
+ bool ready=size>0xB0BD0;
+ for (unsigned i=0;ready && i<2;++i) ready=!memcmp(reinterpret_cast<void *>(address+copies[i]),before,sizeof(before));
+ for (unsigned i=0;ready && i<3;++i) {
+  auto lea=reinterpret_cast<const uint8_t *>(address+loads[i]);
+  int32_t disp {};memcpy(&disp,lea+3,sizeof(disp));
+  const auto target=address+loads[i]+7+static_cast<int64_t>(disp);
+  ready=lea[0]==0x48 && lea[1]==0x8D && lea[2]==0x35 && (target==address+copies[0] || target==address+copies[1]);
+ }
+ for (unsigned i=0;ready && i<2;++i) {
+  auto site=reinterpret_cast<uint8_t *>(address+copies[i]);
+  KernelPatcher::LookupPatch patch {&kextIntelTGL,before,after,sizeof(before),1};
+  patcher.applyLookupPatch(&patch,site,sizeof(before)+1);
+  ready=!memcmp(site,after,sizeof(after));patcher.clearError();
+ }
+ tglPOSHOffState=ready ? 1 : 0;
+ root->setProperty("TGLPOSHOff",ready);
+ if (!ready) SYSLOG("igfx","TGL POSH-off patch not applied (donor bytes differ); graphics contexts keep POSH");
+}
+
 // Hardware encode admission (see kern_tgl_encode_guard.hpp). Counters are
 // relaxed statistics only; rejection never depends on them.
 namespace {
@@ -11508,6 +11542,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  tglEncodeGuardReady=tglInstallEncodeGuard(patcher,index,address,size);
  tglInstallContextOwners(patcher,index,address,size);
+ tglInstallPOSHOff(patcher,address,size);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.

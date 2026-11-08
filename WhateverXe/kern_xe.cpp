@@ -338,11 +338,15 @@ bool tglResetTraceSerialize(void *,void *,OSSerialize *serializer) {
 // the engine: live RCS registers, the stuck context's LRC state page, and the
 // 32 ring dwords before the hardware head. No writes, no donor calls.
 // q0 uptime, q1 channel|type<<32|flags<<40, q2..10 register pairs, q11..50 LRC
-// state dwords 0x1000..0x113F, q51..66 ring, q67 ok|seq<<8|mask<<32, q68 ready.
-constexpr unsigned tglHangWords=69, tglHangRecords=8;
+// state dwords 0x1000..0x113F, q51..66 ring, q67 ok|seq<<8|mask<<32,
+// q69..80 pre|post<<32 for tglHangL3Regs, q81 ready.
+constexpr unsigned tglHangWords=82, tglHangRecords=8;
+// Pre/post-reset samples of the start-only GT/L3 registers (q69..80).
+constexpr uint32_t tglHangL3Regs[12] {0xB134,0xB138,0xB118,0xB404,0xB43C,0x94D4,0xE48C,0xE4F4,0xE18C,0x20EC,0x2580,0x7304};
 constexpr uint32_t tglHangRegs[18] {0x2030,0x2034,0x2038,0x203C,0x2064,0x2068,0x206C,0x2074,
 	0x2110,0x2140,0x2168,0x2244,0x209C,0x2234,0x2238,0x23A0,0x2050,0x44050};
 uint64_t tglHangRecord[tglHangRecords][tglHangWords] {};
+uint64_t *tglHangLastRecord {};
 uint32_t tglHangCount {};
 void tglHangCapture(void *channel) {
 	const auto n=__atomic_fetch_add(&tglHangCount,1,__ATOMIC_RELAXED);
@@ -355,6 +359,7 @@ void tglHangCapture(void *channel) {
 		auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(bar+r);};
 		for (unsigned i=0;i<18;i+=2) q[2+i/2]=rd(tglHangRegs[i])|static_cast<uint64_t>(rd(tglHangRegs[i+1]))<<32;
 		head=static_cast<uint32_t>(q[2]>>32);ok|=1;
+		for (unsigned i=0;i<12;++i) q[69+i]=rd(tglHangL3Regs[i]);
 	}
 	void *ring=TGLRecovery::field<void *>(channel,0x130);
 	void *ctx=ring ? TGLRecovery::field<void *>(ring,0x20) : nullptr;
@@ -376,7 +381,16 @@ void tglHangCapture(void *channel) {
 		ok|=4;
 	}
 	q[67]=ok|static_cast<uint64_t>(n+1)<<8|static_cast<uint64_t>(mask)<<32;
-	__atomic_store_n(&q[68],1,__ATOMIC_RELEASE);
+	tglHangLastRecord=q;
+}
+// After the native reset and our restore: post-reset samples, then publish.
+void tglHangFinish(void *channel) {
+	auto q=tglHangLastRecord;if (!q) return;tglHangLastRecord=nullptr;
+	void *accel=TGLRecovery::field<void *>(channel,0x18);
+	auto bar=accel ? TGLRecovery::field<volatile uint8_t *>(accel,0x1240) : nullptr;
+	if (bar) for (unsigned i=0;i<12;++i)
+		q[69+i]|=static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(bar+tglHangL3Regs[i]))<<32;
+	__atomic_store_n(&q[81],1,__ATOMIC_RELEASE);
 }
 bool tglHangSerialize(void *,void *,OSSerialize *serializer) {
 	const uint64_t head[4] {1,__atomic_load_n(&tglHangCount,__ATOMIC_ACQUIRE),tglHangRecords,tglHangWords};
@@ -421,6 +435,7 @@ void XE::wrapTGLRecovery(void *channel) {
 	}
 	const auto result=TGLRecovery::resetAndResume(channel,&tglRecoveryDomain,tglRecoveryForceWake,
 		tglRecoverySubmitStamp);
+	tglHangFinish(channel);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
 		auto q=tglRecoveryRecords[n];q[0]=125;q[1]=n+1;q[2]=before;q[3]=after;

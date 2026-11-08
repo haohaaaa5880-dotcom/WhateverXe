@@ -334,6 +334,56 @@ bool tglResetTraceSerialize(void *,void *,OSSerialize *serializer) {
 	bool ok=out->appendBytes(head,sizeof(head)) && out->appendBytes(tglResetTrace.record,sizeof(tglResetTrace.record));
 	ok=ok && out->serialize(serializer);out->release();return ok;
 }
+// Hang forensics (schema 1), captured read-only before the native reset touches
+// the engine: live RCS registers, the stuck context's LRC state page, and the
+// 32 ring dwords before the hardware head. No writes, no donor calls.
+// q0 uptime, q1 channel|type<<32|flags<<40, q2..10 register pairs, q11..50 LRC
+// state dwords 0x1000..0x113F, q51..66 ring, q67 ok|seq<<8|mask<<32, q68 ready.
+constexpr unsigned tglHangWords=69, tglHangRecords=8;
+constexpr uint32_t tglHangRegs[18] {0x2030,0x2034,0x2038,0x203C,0x2064,0x2068,0x206C,0x2074,
+	0x2110,0x2140,0x2168,0x2244,0x209C,0x2234,0x2238,0x23A0,0x2050,0x44050};
+uint64_t tglHangRecord[tglHangRecords][tglHangWords] {};
+uint32_t tglHangCount {};
+void tglHangCapture(void *channel) {
+	const auto n=__atomic_fetch_add(&tglHangCount,1,__ATOMIC_RELAXED);
+	auto q=tglHangRecord[n%tglHangRecords];bzero(q,sizeof(tglHangRecord[0]));
+	clock_get_uptime(&q[0]);uint64_t ok {};
+	void *accel=TGLRecovery::field<void *>(channel,0x18);
+	auto bar=accel ? TGLRecovery::field<volatile uint8_t *>(accel,0x1240) : nullptr;
+	uint32_t head {};
+	if (bar) {
+		auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(bar+r);};
+		for (unsigned i=0;i<18;i+=2) q[2+i/2]=rd(tglHangRegs[i])|static_cast<uint64_t>(rd(tglHangRegs[i+1]))<<32;
+		head=static_cast<uint32_t>(q[2]>>32);ok|=1;
+	}
+	void *ring=TGLRecovery::field<void *>(channel,0x130);
+	void *ctx=ring ? TGLRecovery::field<void *>(ring,0x20) : nullptr;
+	void *ch=ctx ? TGLRecovery::field<void *>(ctx,0xB8) : nullptr;
+	q[1]=(ch ? TGLRecovery::field<uint32_t>(ch,0x20) : 0xFFFFFFFFu)|
+		static_cast<uint64_t>(ctx ? TGLRecovery::field<uint8_t>(ctx,0x6C) : 0xFF)<<32|
+		static_cast<uint64_t>(ctx ? TGLRecovery::field<uint8_t>(ctx,0x6E) : 0xFF)<<40;
+	void *imageBuffer=ctx ? TGLRecovery::field<void *>(ctx,0x98) : nullptr;
+	auto image=imageBuffer ? TGLRecovery::field<const uint8_t *>(imageBuffer,0x38) : nullptr;
+	if (image) { memcpy(&q[11],image+0x1000,40*8);ok|=2; }
+	void *ringBuffer=ring ? TGLRecovery::field<void *>(ring,0x80) : nullptr;
+	auto ringVA=ringBuffer ? TGLRecovery::field<const uint8_t *>(ringBuffer,0x38) : nullptr;
+	const uint32_t mask=ring ? TGLRecovery::field<uint32_t>(ring,0x90) : 0;
+	if (ringVA && mask>=0xFFF && ((mask+1)&mask)==0) {
+		auto d=reinterpret_cast<uint32_t *>(&q[51]);
+		const uint32_t end=head&0x1FFFFC;
+		for (unsigned i=0;i<32;++i)
+			d[i]=*reinterpret_cast<const uint32_t *>(ringVA+((end-128+i*4)&mask&~3u));
+		ok|=4;
+	}
+	q[67]=ok|static_cast<uint64_t>(n+1)<<8|static_cast<uint64_t>(mask)<<32;
+	__atomic_store_n(&q[68],1,__ATOMIC_RELEASE);
+}
+bool tglHangSerialize(void *,void *,OSSerialize *serializer) {
+	const uint64_t head[4] {1,__atomic_load_n(&tglHangCount,__ATOMIC_ACQUIRE),tglHangRecords,tglHangWords};
+	auto out=OSData::withCapacity(sizeof(head)+sizeof(tglHangRecord));if (!out) return false;
+	bool ok=out->appendBytes(head,sizeof(head)) && out->appendBytes(tglHangRecord,sizeof(tglHangRecord));
+	ok=ok && out->serialize(serializer);out->release();return ok;
+}
 bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 	// Built in the OSData, not on the kernel stack (boot-stack budget).
 	const uint64_t head[2] {__atomic_load_n(&tglRecoveryCalls,__ATOMIC_ACQUIRE),
@@ -352,6 +402,7 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
+	tglHangCapture(channel);
 	{
 		// Trace the streamer of the ring being recovered (aux = channel index).
 		void *ring=TGLRecovery::field<void *>(channel,0x130);
@@ -12350,6 +12401,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				}
 				if (recoveryOK) if (auto trace=OSSerializer::forTarget(nullptr,tglResetTraceSerialize)) {
 					IORegistryEntry::getRegistryRoot()->setProperty("TGLResetTrace",trace);trace->release();
+				}
+				if (recoveryOK) if (auto hang=OSSerializer::forTarget(nullptr,tglHangSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLHangForensics",hang);hang->release();
 				}
 				if (recoveryOK) if (auto display=OSSerializer::forTarget(nullptr,tglDisplaySyncSerialize)) {
 					IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplaySyncLive",display);display->release();

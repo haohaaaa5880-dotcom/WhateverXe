@@ -84,6 +84,8 @@
 #include "kern_tgl_recovery.hpp"
 #include "kern_tgl_encode_guard.hpp"
 #include "kern_tgl_reset_trace.hpp"
+#include "kern_tgl_context_owners.hpp"
+#include <sys/proc.h>
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -11398,6 +11400,40 @@ bool tglInstallEncodeGuard(KernelPatcher &patcher,size_t index,mach_vm_address_t
  if(!ready)SYSLOG("igfx","TGL hardware encode guard unavailable: donor image does not match");
  return ready;
 }
+
+// Hardware-context ownership map (kern_tgl_context_owners.hpp), diagnostic only.
+TGLContextOwners::Ring tglContextOwners;
+mach_vm_address_t tglContextInitOrg {};
+bool tglContextInit(void *context,void *task,const void *params,uint8_t flags) {
+ const bool ok=FunctionCast(tglContextInit,tglContextInitOrg)(context,task,params,flags);
+ if(ok) {
+  char name[TGLContextOwners::nameLength] {};proc_selfname(name,sizeof(name));
+  TGLContextOwners::note(tglContextOwners,context,proc_selfpid(),name);
+ }
+ return ok;
+}
+bool tglContextOwnersSerialize(void *,void *,OSSerialize *serializer) {
+ // Schema 1: next sequence, capacity, then 128 owners {seq, tag, pid, name[16]}.
+ const uint64_t head[3] {1,__atomic_load_n(&tglContextOwners.next,__ATOMIC_ACQUIRE),TGLContextOwners::capacity};
+ auto out=OSData::withCapacity(sizeof(head)+sizeof(tglContextOwners.slot));if(!out)return false;
+ bool ok=out->appendBytes(head,sizeof(head)) && out->appendBytes(tglContextOwners.slot,sizeof(tglContextOwners.slot));
+ ok=ok && out->serialize(serializer);out->release();return ok;
+}
+bool tglInstallContextOwners(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ const char *init="__ZN17IGHardwareContext15initWithOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh";
+ bool ready=size>TGLContextOwners::contextInitEntry+sizeof(TGLContextOwners::contextInitPrologue) &&
+  patcher.solveSymbol<mach_vm_address_t>(index,init,address,size)==address+TGLContextOwners::contextInitEntry &&
+  !memcmp(reinterpret_cast<const void *>(address+TGLContextOwners::contextInitEntry),TGLContextOwners::contextInitPrologue,sizeof(TGLContextOwners::contextInitPrologue));
+ patcher.clearError();
+ if(ready) {
+  KernelPatcher::RouteRequest owner(init,tglContextInit,tglContextInitOrg);
+  ready=patcher.routeMultiple(index,&owner,1,address,size);patcher.clearError();
+ }
+ if(ready)if(auto live=OSSerializer::forTarget(nullptr,tglContextOwnersSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("TGLContextOwners",live);live->release();
+ }
+ return ready;
+}
 }
 
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -11419,6 +11455,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  tglEncodeGuardReady=tglInstallEncodeGuard(patcher,index,address,size);
+ tglInstallContextOwners(patcher,index,address,size);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.

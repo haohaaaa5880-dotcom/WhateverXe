@@ -98,6 +98,10 @@ void buildCases() {
 	assert(at(0x1A29C)>=0 && d.storage[at(0x1A29C)].masked==1);
 	for (uint32_t reg:{0x24D8U,0x24DCU,0x24E0U,0x24F0U,0x24F4U,0x24F8U,0x24FCU})
 		assert(at(reg)>0 && !d.storage[at(reg)].masked);
+	// RING_PSMI_CTL wait-for-event workaround, masked, on both render-domain engines;
+	// the CCS copy follows the RCU_MODE CCS enable.
+	assert(at(0x2050)>0 && d.storage[at(0x2050)].masked==1);
+	assert(at(0x1A050)>at(0x14800) && d.storage[at(0x1A050)].masked==1);
 	bool imr=false;
 	for (uint64_t i=0;i<d.merged.count;++i) {
 		assert(d.storage[i].value==0); // values come only from the native pre-reset sample

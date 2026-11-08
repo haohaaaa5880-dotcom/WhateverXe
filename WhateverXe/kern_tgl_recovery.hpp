@@ -43,8 +43,16 @@ struct Extra { uint32_t reg; bool masked; };
 // registers zero after every reset until this is restored. It precedes the CCS
 // list so the engine is enabled before its own registers are rewritten. The
 // RCS FORCE_TO_NONPRIV slots 24D8..24FC complete the native 24D0/24D4 entries.
+// RING_PSMI_CTL (RCS 2050 / CCS 1A050, masked) carries the TGL wait-for-event
+// workaround that native IntelAccelerator::setAsyncSliceCount applies only at
+// start (258A5/258CD: |= 0x10801080 = WAIT_FOR_EVENT_POWER_DOWN_DISABLE bit7 |
+// RC_SEMA_IDLE_MSG_DISABLE bit12; Linux Wa_1607030317/1607186500/1607297627).
+// GDRST mask 2 clears it and no native path reapplies it: afterwards RCS can
+// power down inside MI_WAIT_FOR_EVENT and miss the display scanline event,
+// so WindowServer's scanline waits never complete and every later reset
+// recurs (live captures run-104625/run-110954, upstream #44/#62).
 inline constexpr Extra domainExtras[] {
-	{0x14800,true},
+	{0x14800,true},{0x2050,true},
 	{0x24D8,false},{0x24DC,false},{0x24E0,false},{0x24F0,false},{0x24F4,false},{0x24F8,false},{0x24FC,false}
 };
 // CCS engine registers at the same offsets the native RCS list restores for
@@ -52,7 +60,7 @@ inline constexpr Extra domainExtras[] {
 // and CSFE chicken D4 (masked, as in the RCS list). Values are never invented:
 // the native reset samples each one immediately before GDRST.
 inline constexpr Extra computeExtras[] {
-	{0x1A0A8,false},{0x1A058,false},{0x1A4D0,false},{0x1A4D4,false},{0x1A0D4,true}
+	{0x1A0A8,false},{0x1A058,false},{0x1A4D0,false},{0x1A4D4,false},{0x1A0D4,true},{0x1A050,true}
 };
 
 struct Domain {

@@ -81,7 +81,6 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 ### Optional boot arguments
 
 - `-wex-tgl-hwenc`: allow Tiger Lake hardware video encode (VideoToolbox H.264). It is refused by default; see [known issues](#known-issues-and-limits).
-- `-wex-tgl-posh`: keep position-only shading (POSH) paired contexts for Tiger Lake Metal graphics. They are disabled by default because they stall the render engine.
 
 ### Other settings
 

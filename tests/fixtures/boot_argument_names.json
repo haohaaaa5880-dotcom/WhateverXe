@@ -119,8 +119,6 @@
     "-igfxtgloff"
   ],
   "-wex-tgl-hwenc": [],
-  "-wex-tgl-no-l3reinit": [],
-  "-wex-tgl-no-ctxwa": [],
   "-wex-tgl-prog-off": [
     "-tglprogoff"
   ],

@@ -125,7 +125,6 @@ struct Result {
 	uint32_t siblingIndex {0xFFFFFFFF};
 	uint8_t stampsAppended {};
 	PortSnapshot ports[2] {};  // RCS, CCS before reset
-	bool cacheReinit {};       // native initCache re-run after GDRST
 };
 
 using ForceWake=void (*)(void *,bool,unsigned);
@@ -189,14 +188,8 @@ inline bool usesGDRST(void *ring,uint8_t type) {
 // With a ready domain, a render-domain GDRST restores both engines' registers
 // and the sibling engine receives the same native processGPUReset the reset
 // engine already received inside resetGraphicsEngine.
-// Re-runs the donor's cache/L3 setup (IGMemoryManager::initCache, also used by
-// systemDidWake) on the accelerator. GDRST reverts the L3 allocation
-// (B134/B138: D0000020/0 -> 88000020/40000040 in live forensics) and a raw
-// register write does not reliably stick, so use the native sequence with its
-// own forcewake. Returns true when it ran.
-using ReinitCache=bool (*)(void *owner);
 inline Result resetAndResume(void *channel,Domain *domain=nullptr,ForceWake forceWake=nullptr,
-	SubmitStamp submitStamp=nullptr,ReinitCache reinitCache=nullptr) {
+	SubmitStamp submitStamp=nullptr) {
 	void *ring=field<void *>(channel,0x130);
 	void *context=field<void *>(ring,0x20);
 	void *affected=field<void *>(context,0xB8); // ICL uses B0, NOT compatible.
@@ -226,8 +219,6 @@ inline Result resetAndResume(void *channel,Domain *domain=nullptr,ForceWake forc
 	void *owner=field<void *>(channel,0x18);
 	void *scheduler=field<void *>(owner,0x1250); // ICL uses1280.
 	void *siblingChannel=nullptr;
-	// Engines are idle here: after GDRST and before any resubmission.
-	if (shared && result.resetOK && reinitCache) result.cacheReinit=reinitCache(owner);
 	if (shared && result.resetOK) {
 		const uint8_t sibling=type==renderType ? computeType : renderType;
 		result.siblingType=sibling;

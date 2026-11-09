@@ -322,20 +322,6 @@ uint64_t tglRecoveryRecords[16][tglRecoveryWords] {};
 TGLRecovery::Domain tglRecoveryDomain;
 TGLRecovery::ForceWake tglRecoveryForceWake {};
 TGLRecovery::SubmitStamp tglRecoverySubmitStamp {};
-// Exact donor IGMemoryManager::initCache (vtable slot 0x120 of the owner's
-// memory manager at +1260). Null when unresolved or -wex-tgl-no-l3reinit.
-uintptr_t tglInitCache {};
-uint32_t tglInitCacheRuns {};
-bool tglReinitCache(void *owner) {
-	if (!tglInitCache || !owner) return false;
-	void *manager=TGLRecovery::field<void *>(owner,0x1260);
-	if (!manager || TGLRecovery::field<void *>(manager,0x10)!=owner) return false;
-	auto vtable=TGLRecovery::field<uintptr_t *>(manager,0);
-	if (!vtable || vtable[0x120/8]!=tglInitCache) return false;
-	reinterpret_cast<void (*)(void *)>(tglInitCache)(manager);
-	__atomic_fetch_add(&tglInitCacheRuns,1,__ATOMIC_RELAXED);
-	return true;
-}
 bool tglRecoveryDomainTried {false};
 TGLResetTrace::Ring tglResetTrace;
 bool tglDisplaySyncSerialize(void *,void *,OSSerialize *serializer);
@@ -352,15 +338,11 @@ bool tglResetTraceSerialize(void *,void *,OSSerialize *serializer) {
 // the engine: live RCS registers, the stuck context's LRC state page, and the
 // 32 ring dwords before the hardware head. No writes, no donor calls.
 // q0 uptime, q1 channel|type<<32|flags<<40, q2..10 register pairs, q11..50 LRC
-// state dwords 0x1000..0x113F, q51..66 ring, q67 ok|seq<<8|mask<<32,
-// q69..80 pre|post<<32 for tglHangL3Regs, q81 ready.
-constexpr unsigned tglHangWords=82, tglHangRecords=8;
-// Pre/post-reset samples of the start-only GT/L3 registers (q69..80).
-constexpr uint32_t tglHangL3Regs[12] {0xB134,0xB138,0xB118,0xB404,0xB43C,0x94D4,0xE48C,0xE4F4,0xE18C,0x20EC,0x2580,0x7304};
+// state dwords 0x1000..0x113F, q51..66 ring, q67 ok|seq<<8|mask<<32, q68 ready.
+constexpr unsigned tglHangWords=69, tglHangRecords=8;
 constexpr uint32_t tglHangRegs[18] {0x2030,0x2034,0x2038,0x203C,0x2064,0x2068,0x206C,0x2074,
 	0x2110,0x2140,0x2168,0x2244,0x209C,0x2234,0x2238,0x23A0,0x2050,0x44050};
 uint64_t tglHangRecord[tglHangRecords][tglHangWords] {};
-uint64_t *tglHangLastRecord {};
 uint32_t tglHangCount {};
 void tglHangCapture(void *channel) {
 	const auto n=__atomic_fetch_add(&tglHangCount,1,__ATOMIC_RELAXED);
@@ -373,7 +355,6 @@ void tglHangCapture(void *channel) {
 		auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(bar+r);};
 		for (unsigned i=0;i<18;i+=2) q[2+i/2]=rd(tglHangRegs[i])|static_cast<uint64_t>(rd(tglHangRegs[i+1]))<<32;
 		head=static_cast<uint32_t>(q[2]>>32);ok|=1;
-		for (unsigned i=0;i<12;++i) q[69+i]=rd(tglHangL3Regs[i]);
 	}
 	void *ring=TGLRecovery::field<void *>(channel,0x130);
 	void *ctx=ring ? TGLRecovery::field<void *>(ring,0x20) : nullptr;
@@ -395,16 +376,7 @@ void tglHangCapture(void *channel) {
 		ok|=4;
 	}
 	q[67]=ok|static_cast<uint64_t>(n+1)<<8|static_cast<uint64_t>(mask)<<32;
-	tglHangLastRecord=q;
-}
-// After the native reset and our restore: post-reset samples, then publish.
-void tglHangFinish(void *channel) {
-	auto q=tglHangLastRecord;if (!q) return;tglHangLastRecord=nullptr;
-	void *accel=TGLRecovery::field<void *>(channel,0x18);
-	auto bar=accel ? TGLRecovery::field<volatile uint8_t *>(accel,0x1240) : nullptr;
-	if (bar) for (unsigned i=0;i<12;++i)
-		q[69+i]|=static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(bar+tglHangL3Regs[i]))<<32;
-	__atomic_store_n(&q[81],1,__ATOMIC_RELEASE);
+	__atomic_store_n(&q[68],1,__ATOMIC_RELEASE);
 }
 bool tglHangSerialize(void *,void *,OSSerialize *serializer) {
 	const uint64_t head[4] {1,__atomic_load_n(&tglHangCount,__ATOMIC_ACQUIRE),tglHangRecords,tglHangWords};
@@ -448,8 +420,7 @@ void XE::wrapTGLRecovery(void *channel) {
 			SYSLOG("igfx","TGL render-domain reset list unavailable; native single-ring restore kept");
 	}
 	const auto result=TGLRecovery::resetAndResume(channel,&tglRecoveryDomain,tglRecoveryForceWake,
-		tglRecoverySubmitStamp,tglReinitCache);
-	tglHangFinish(channel);
+		tglRecoverySubmitStamp);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
 		auto q=tglRecoveryRecords[n];q[0]=125;q[1]=n+1;q[2]=before;q[3]=after;
@@ -457,7 +428,7 @@ void XE::wrapTGLRecovery(void *channel) {
 		q[6]=result.context;q[7]=result.affected;q[8]=result.index;
 		q[9]=result.failuresBefore;q[10]=result.failuresAfter;q[11]=result.resetOK;
 		q[12]=result.type|static_cast<uint64_t>(result.siblingType)<<8;
-		q[13]=result.domainList|static_cast<uint64_t>(result.siblingReset)<<1|static_cast<uint64_t>(result.cacheReinit)<<2;
+		q[13]=result.domainList|static_cast<uint64_t>(result.siblingReset)<<1;
 		q[14]=tglRecoveryDomain.ready ? tglRecoveryDomain.merged.count : 0;
 		q[15]=result.siblingIndex|static_cast<uint64_t>(result.stampsAppended)<<32;
 		// Per engine (RCS q16..22, CCS q23..29): port, then for each port/element
@@ -595,22 +566,8 @@ static bool tglCPSPrepare(void *owner) {
  // complete TGL timer value after every context restore; no read/modify/write.
  // r160: Wa_1606931601, masked EU early-read disable. Existing multicast
  // steering is retained; this adds no CPU MMIO write or synchronization wait.
- // Linux gen12/TGL render workarounds the donor sets only conditionally, on
- // other bits, or by a one-time MMIO write (all masked, re-applied on every
- // RCS context restore so GDRST and RC6 cannot drop them):
- //  E4F4 bit8  Wa_1409804808 PUSH_CONST_DEREF_HOLD_DIS (with bit14 above)
- //  2580 [2:1]=01 WaDisableGPGPUMidThreadPreemption:gen12 (thread-group level)
- //  7018 bit13 Wa_1806527549 HZ_DEPTH_TEST_LE_GE_OPT_DISABLE
- //  7300 bit6  Wa_1606376872 DISABLE_TDC_LOAD_BALANCING_CALC
- //  20EC bit1  Wa_1606700617/22010271021/14010826681 FF_DOP_CLOCK_GATE_DISABLE
- //  E18C bit15 Wa_1406941453 ENABLE_SMALLPL
- const uint32_t batch[] {0,0x1100000F,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x41004100,
-  0x2580,0x00060002,0x7018,0x20002000,0x7300,0x00400040,0x20EC,0x00020002,0xE18C,0x80008000,0x05000000};
- // -wex-tgl-no-ctxwa keeps the previous three-register batch.
- static const uint32_t legacy[] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000,0x05000000};
- const bool reduced=checkKernelArgument("-wex-tgl-no-ctxwa");
- bzero(cpu,extent);
- if(reduced)memcpy(cpu,legacy,sizeof(legacy));else memcpy(cpu,batch,sizeof(batch));
+ const uint32_t batch[] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000,0x05000000};
+ bzero(cpu,extent);memcpy(cpu,batch,sizeof(batch));
  if(tglContextCacheEnabled)TGLContextCache::batch(cpu);
  // Publish CPU writes before first GPU use, independent of LLC policy.
  for(unsigned i=0;i<extent;i+=64)asm volatile("clflush (%0)"::"r"(cpu+i):"memory");
@@ -12473,18 +12430,6 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					}
 				}
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryRenderDomainReady",domainOK);
-				// Native cache/L3 re-init after GDRST (see TGLRecovery::ReinitCache).
-				// Exact donor entry; it takes its own SafeForceWake(…,5) pair.
-				bool cacheOK=false;
-				if (domainOK && !checkKernelArgument("-wex-tgl-no-l3reinit")) {
-					const auto init=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN15IGMemoryManager9initCacheEv",address,size);
-					const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x49,0x89,0xFE,0x31,0xFF};
-					cacheOK=init==address+0xFE1A && size>0xFF56 &&
-						!memcmp(reinterpret_cast<void *>(init),head,sizeof(head));
-					if (cacheOK) tglInitCache=init;
-				}
-				patcher.clearError();
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryCacheReinitReady",cacheOK);
 				// Native completion stamp (resetHardwareAndReplay 4CA79..4CA97):
 				// owner(+18)->events(+380)->vtable1D8(index +20), then
 				// submitStampCommand. Qualify the exact sequence and callee.

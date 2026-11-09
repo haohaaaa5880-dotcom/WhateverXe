@@ -81,8 +81,6 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 ### Optional boot arguments
 
 - `-wex-tgl-hwenc`: allow Tiger Lake hardware video encode (VideoToolbox H.264). It is refused by default; see [known issues](#known-issues-and-limits).
-- `-wex-tgl-no-l3reinit`: do not re-run the native cache/L3 setup after a Tiger Lake render-domain GPU reset.
-- `-wex-tgl-no-ctxwa`: apply only the original three Tiger Lake per-context render workarounds instead of the extended Linux gen12 set.
 
 ### Other settings
 

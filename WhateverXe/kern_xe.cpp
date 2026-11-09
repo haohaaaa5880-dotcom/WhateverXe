@@ -617,9 +617,56 @@ static bool tglCPSRestorePointer(void *context,uintptr_t caller) {
  __atomic_fetch_add(&tglCPSCounts[15],1,__ATOMIC_RELAXED);
  return true;
 }
+// POSH fields of a restored RCS image. initWithOptions fixes a safe-image clone
+// after restoreFromSafeImage (7C15E..7C25C): a non-POSH context gets CTX_CTRL
+// bit 4 cleared (masked write), a POSH context gets POSH_LRCA = its own POCS
+// buffer. beginReset (7C919) calls restoreFromSafeImage alone, so after a
+// reset every RCS context carries the golden context's CTX_CTRL bit 4 and
+// POSH_LRCA (forensics: WindowServer POSH_LRCA 402c3000 -> golden 402b4000).
+// Put back the creation-time state on the reset path; non-POSH contexts also
+// drop the inherited POSH_LRCA on both paths (NootedGreen-NP550XDA xe/noposh).
+// Counts: reset POSH relinked, reset non-POSH fixed, new non-POSH cleared,
+// declined (layout mismatch). Opt-out: -wex-tgl-no-poshfix.
+bool tglPOSHRepairEnabled {};
+uint32_t tglPOSHRepairCounts[4] {};
+static volatile uint32_t *tglPOSHImage(void *context) {
+ auto c=static_cast<uint8_t *>(context);
+ if(!c || c[0x6C]!=0 || !tglCPSCPUAddress)return nullptr;
+ auto buffer=*reinterpret_cast<uint8_t **>(c+0x98);
+ if(!buffer || *reinterpret_cast<uint64_t *>(buffer+0x20)<0x2000)return nullptr;
+ auto img=static_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(tglCPSCPUAddress)(buffer));
+ if(!img || img[0x1008/4]!=0x2244 || img[0x10D4/4]!=0x21B0)return nullptr;
+ return img;
+}
+static void tglPOSHRepair(void *context,bool reset,uint32_t saved) {
+ auto img=tglPOSHImage(context);
+ if(!img) { __atomic_fetch_add(&tglPOSHRepairCounts[3],1,__ATOMIC_RELAXED);return; }
+ auto &control=img[0x100C/4],&lrca=img[0x10D8/4];
+ if(static_cast<uint8_t *>(context)[0x6E]&0x10) {
+  if(!reset || !saved)return;
+  lrca=saved;__atomic_fetch_add(&tglPOSHRepairCounts[0],1,__ATOMIC_RELAXED);
+ } else {
+  if(reset)control=(control&0xFFEFFFEFu)|0x00100000u;
+  lrca=0;__atomic_fetch_add(&tglPOSHRepairCounts[reset ? 1 : 2],1,__ATOMIC_RELAXED);
+ }
+ asm volatile("clflush (%0)"::"r"(&control):"memory");
+ asm volatile("clflush (%0)"::"r"(&lrca):"memory");
+ asm volatile("mfence":::"memory");
+}
+bool tglPOSHRepairSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[5] {1};
+ for(unsigned i=0;i<4;++i)out[i+1]=__atomic_load_n(&tglPOSHRepairCounts[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 bool tglCPSRestore(void *context) {
  const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+ const bool reset=caller!=tglCPSRestoreCaller;
+ uint32_t saved {};
+ if(tglPOSHRepairEnabled && reset)
+  if(auto img=tglPOSHImage(context))saved=img[0x10D8/4];
  const bool result=FunctionCast(tglCPSRestore,tglCPSRestoreOriginal)(context);
+ if(result && tglPOSHRepairEnabled)tglPOSHRepair(context,reset,saved);
  if(result && caller==tglCPSRestoreCaller)adlnCaptureOwnedGolden(context);
  return result && tglCPSRestorePointer(context,caller) &&
   (caller!=tglCPSRestoreCaller || tglAlderLakeNGoldenRestore(context));
@@ -11418,6 +11465,45 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+// Metal command-queue graphics contexts are created from one file-static copy
+// of g_cInitGfxHwCtxParamsForGraphics (0xB0BC0, loaded only by
+// IGAccelCommandQueue::createHardwareContextIfNeeded). Its flags byte 0x1C
+// includes 0x10: pair the RCS context with a POCS (position-only shading)
+// context. The donor tells user space POSH is off
+// (_kIntelSharedExFtrPoshEnable = 0), GL/compute/video contexts use 0x0C, and
+// Linux never enables POSH on Gen12 LP. Every RCS hang captured on this
+// machine is such a paired WindowServer context, stalled with its ring fully
+// consumed and both RCS and POCS not done.
+// The other copy (0xB09A4) builds the start-time init/golden context.
+// startGraphicsEngine copies that context's POCS image unconditionally, so it
+// must keep POSH (clearing it panics at boot). Non-POSH contexts restored from a
+// POSH golden image are the native GL path (initWithOptions clears CTX_CTRL
+// bit 4 and skips the POCS image). Opt-out: -wex-tgl-posh.
+static void tglInstallPOSHOff(KernelPatcher &patcher,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-posh")) { root->setProperty("TGLPOSHOff",false);return; }
+ static const uint8_t before[12] {0,0,0x1C,0,0,0,0,0,0,0,0,0}, after[12] {0,0,0x0C,0,0,0,0,0,0,0,0,0};
+ constexpr uint32_t queueCopy=0xB0BC0, initCopy=0xB09A4, queueLoad=0x2FD76, initLoads[2] {0x25D95,0x25DB9};
+ auto target=[&](uint32_t site)->mach_vm_address_t {
+  auto lea=reinterpret_cast<const uint8_t *>(address+site);
+  if (lea[0]!=0x48 || lea[1]!=0x8D || lea[2]!=0x35) return 0;
+  int32_t disp {};memcpy(&disp,lea+3,sizeof(disp));
+  return address+site+7+static_cast<int64_t>(disp);
+ };
+ bool ready=size>0xB0BD0 && !memcmp(reinterpret_cast<void *>(address+queueCopy),before,sizeof(before)) &&
+  !memcmp(reinterpret_cast<void *>(address+initCopy),before,sizeof(before)) &&
+  target(queueLoad)==address+queueCopy && target(initLoads[0])==address+initCopy && target(initLoads[1])==address+initCopy;
+ if (ready) {
+  auto site=reinterpret_cast<uint8_t *>(address+queueCopy);
+  KernelPatcher::LookupPatch patch {&kextIntelTGL,before,after,sizeof(before),1};
+  patcher.applyLookupPatch(&patch,site,sizeof(before)+1);
+  ready=!memcmp(site,after,sizeof(after)) && !memcmp(reinterpret_cast<void *>(address+initCopy),before,sizeof(before));
+  patcher.clearError();
+ }
+ root->setProperty("TGLPOSHOff",ready);
+ if (!ready) SYSLOG("igfx","TGL POSH-off patch not applied (donor bytes differ); graphics contexts keep POSH");
+}
+
 // GT frequency floor. Without GuC/SLPC (-disablegfxfirmware) the donor's
 // power query fails and IGHardwareCommandStreamer5::setGTFrequencyMMIO writes
 // RPNSWREQ (A008) = 0 on every submission (submitExecList 3A70A..3A74D and the
@@ -11580,6 +11666,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  tglEncodeGuardReady=tglInstallEncodeGuard(patcher,index,address,size);
  tglInstallContextOwners(patcher,index,address,size);
  tglInstallGTFreqFloor(patcher,index,address,size);
+ tglInstallPOSHOff(patcher,address,size);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
@@ -12266,6 +12353,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			patcher.clearError();
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeReady",cpsOK);
+			tglPOSHRepairEnabled=cpsOK && !checkKernelArgument("-wex-tgl-no-poshfix");
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLPOSHRepairReady",tglPOSHRepairEnabled);
+			if(tglPOSHRepairEnabled) if(auto live=OSSerializer::forTarget(nullptr,tglPOSHRepairSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLPOSHRepairLive",live);live->release();
+			}
 			// Linux Gen12 Wa_18022495364: an INDIRECT_CTX cache invalidation,
 			// distinct from ring PIPE_CONTROL. Keep the per-context batch intact.
 			bool contextCacheOK=!contextCacheRequested;

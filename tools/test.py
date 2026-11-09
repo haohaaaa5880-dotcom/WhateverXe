@@ -23,7 +23,7 @@ python_tests += ['display13_cursor_resize','dsi_presentation','dsi_native_mode',
 python_tests += ['dsi_backlight_adapter','dsi_restart','dsi_panel','dsi_command_adapter','dsi_irq_live','dsi_surface_adapter','dsi_aperture_adapter']
 python_tests += ['display13_shutdown','display13_wake_notifications']
 python_tests += ['released_physical_admission','released_topology','accelerator_resources']
-python_tests += ['tgl_encode_guard','tgl_context_owners','tgl_gt_freq']
+python_tests += ['tgl_encode_guard','tgl_context_owners','tgl_gt_freq','tgl_posh_off']
 jobs += [(n,[sys.executable,str(R/'tests'/(n+'.py'))],None) for n in python_tests]
 for family,kernel in kernel_inputs.items():
  jobs += [(families[family]+'_pmap_native',[sys.executable,str(R/'tests'/(families[family]+'_pmap.py')),'--kernel',str(kernel),'--hde-source',str(a.hde_source.resolve())],None)]
@@ -44,7 +44,7 @@ if a.donor:jobs += [('adls_ddi_power_native',[sys.executable,str(R/'tests/adls_d
 if a.donor:jobs += [(n+'_native',[sys.executable,str(R/'tests'/(n+'.py')),str(a.donor.resolve())],None) for n in ['display13_tc_preparation','display13_retirement','display13_port_wait','framebuffer_training_registration','framebuffer_common','tgl_hdmi_wiring','framebuffer_donor_runtime','display13_training_lease','display13_tc_native','display13_ddc','tgl_power_fuses', 'display13_aux', 'display13_sst', 'display13_combo_clock', 'adls_panel_pwm', 'display13_panel_runtime', 'tgl_panel_timing','tgl_agdc_port_status','tgl_tc_native','tgl_tc_mode','tgl_mode_native','tgl_panel_depth_route','adls_donor','adls_clock_native']]
 if a.accelerator:jobs += [('dsi_backing_adapter_native',[sys.executable,str(R/'tests/dsi_backing_adapter.py'),str(a.accelerator.resolve())],None)]
 if a.accelerator:jobs += [('dsi_backing_native',[sys.executable,str(R/'tests/dsi_backing_native.py'),str(a.accelerator.resolve())],None)]
-if a.accelerator:jobs += [('xelp_forcewake_irq_native',[sys.executable,str(R/'tests/xelp_forcewake_irq.py'),'--donor',str(a.accelerator.resolve())],None),('tgl_rpcs_native',[sys.executable,str(R/'tests/tgl_rpcs_native.py'),str(a.accelerator.resolve())],None)] + [(n+'_native',[sys.executable,str(R/'tests'/(n+'.py')),str(a.accelerator.resolve())],None) for n in ['small_gt_urb','tgl_tlb_preparser','tgl_semaphore_tlb','tgl_iosurface_compression','tgl_encode_guard','tgl_context_owners','tgl_gt_freq']]
+if a.accelerator:jobs += [('xelp_forcewake_irq_native',[sys.executable,str(R/'tests/xelp_forcewake_irq.py'),'--donor',str(a.accelerator.resolve())],None),('tgl_rpcs_native',[sys.executable,str(R/'tests/tgl_rpcs_native.py'),str(a.accelerator.resolve())],None)] + [(n+'_native',[sys.executable,str(R/'tests'/(n+'.py')),str(a.accelerator.resolve())],None) for n in ['small_gt_urb','tgl_tlb_preparser','tgl_semaphore_tlb','tgl_iosurface_compression','tgl_encode_guard','tgl_context_owners','tgl_gt_freq','tgl_posh_off']]
 def check(job):
  n,compile,execute=job
  with (O/(n+'.log')).open('w') as log:

@@ -82,6 +82,8 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 
 - `-wex-tgl-hwenc`: allow Tiger Lake hardware video encode (VideoToolbox H.264). It is refused by default; see [known issues](#known-issues-and-limits).
 - `-wex-tgl-no-gtfreq`: do not raise the Tiger Lake GT frequency request when the native driver asks for 0 (no GuC). By default such requests become 1500 MHz, clamped by the hardware to its maximum.
+- `-wex-tgl-posh`: keep position-only shading (POSH) paired contexts for Tiger Lake Metal graphics. They are disabled by default because they stall the render engine.
+- `-wex-tgl-no-poshfix`: do not repair the POSH fields (CTX_CTRL bit 4, POSH_LRCA) of a Tiger Lake render context after the native reset reloads the golden image.
 
 ### Other settings
 

@@ -63,6 +63,7 @@ bool checkKernelArgument(const char *name) { return args.count(name); }
 static bool display13Offline;
 static int kextIntelTGLFb, kextAppleIntelTGLCompat, kextIntelTGL;
 static struct { void onKextLoadForce(int *) {} } lilu;
+static void tglRegisterMetalLeakFix() {} // Lilu user patch; tests/tgl_metal_leak.py
 struct XE {
  XELP::Profile xeProfile;
  bool tglGT2Detected=false,tglGT2Ready=false;

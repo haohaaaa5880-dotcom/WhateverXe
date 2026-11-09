@@ -52,17 +52,9 @@ struct Extra { uint32_t reg; bool masked; };
 // so WindowServer's scanline waits never complete and every later reset
 // recurs (live captures run-104625/run-110954, upstream #44/#62).
 // RCS EMR (20B4) is also lost (FFFFFFFA -> FFFFFFFF in run-112942 reports).
-// Start-only GT/L3 state outside the native list (setAsyncSliceCount and
-// IntelTGLMemoryManager::initGTL3Layout): L3 allocation B134/B138, L3SQCREG4
-// B118, GLBLINVL B404, LSN_UNSLCVC B43C, SLICE_UNIT_LEVEL_CLKGATE 94D4, and the
-// masked ROW_CHICKEN4 E48C / ROW_CHICKEN2 E4F4 / SAMPLER_MODE E18C. Linux
-// re-applies every engine workaround and the L3 tables after each reset
-// (intel_engine_resume, execlists_resume); the donor does not.
 inline constexpr Extra domainExtras[] {
 	{0x14800,true},{0x2050,true},{0x20B4,false},
-	{0x24D8,false},{0x24DC,false},{0x24E0,false},{0x24F0,false},{0x24F4,false},{0x24F8,false},{0x24FC,false},
-	{0xB134,false},{0xB138,false},{0xB118,false},{0xB404,false},{0xB43C,false},{0x94D4,false},
-	{0xE48C,true},{0xE4F4,true},{0xE18C,true}
+	{0x24D8,false},{0x24DC,false},{0x24E0,false},{0x24F0,false},{0x24F4,false},{0x24F8,false},{0x24FC,false}
 };
 // CCS engine registers at the same offsets the native RCS list restores for
 // RCS (2000+): IMR A8, indirect-context WA pointer 58, FORCE_TO_NONPRIV 4D0/4D4
@@ -133,6 +125,7 @@ struct Result {
 	uint32_t siblingIndex {0xFFFFFFFF};
 	uint8_t stampsAppended {};
 	PortSnapshot ports[2] {};  // RCS, CCS before reset
+	bool cacheReinit {};       // native initCache re-run after GDRST
 };
 
 using ForceWake=void (*)(void *,bool,unsigned);
@@ -196,8 +189,14 @@ inline bool usesGDRST(void *ring,uint8_t type) {
 // With a ready domain, a render-domain GDRST restores both engines' registers
 // and the sibling engine receives the same native processGPUReset the reset
 // engine already received inside resetGraphicsEngine.
+// Re-runs the donor's cache/L3 setup (IGMemoryManager::initCache, also used by
+// systemDidWake) on the accelerator. GDRST reverts the L3 allocation
+// (B134/B138: D0000020/0 -> 88000020/40000040 in live forensics) and a raw
+// register write does not reliably stick, so use the native sequence with its
+// own forcewake. Returns true when it ran.
+using ReinitCache=bool (*)(void *owner);
 inline Result resetAndResume(void *channel,Domain *domain=nullptr,ForceWake forceWake=nullptr,
-	SubmitStamp submitStamp=nullptr) {
+	SubmitStamp submitStamp=nullptr,ReinitCache reinitCache=nullptr) {
 	void *ring=field<void *>(channel,0x130);
 	void *context=field<void *>(ring,0x20);
 	void *affected=field<void *>(context,0xB8); // ICL uses B0, NOT compatible.
@@ -227,6 +226,8 @@ inline Result resetAndResume(void *channel,Domain *domain=nullptr,ForceWake forc
 	void *owner=field<void *>(channel,0x18);
 	void *scheduler=field<void *>(owner,0x1250); // ICL uses1280.
 	void *siblingChannel=nullptr;
+	// Engines are idle here: after GDRST and before any resubmission.
+	if (shared && result.resetOK && reinitCache) result.cacheReinit=reinitCache(owner);
 	if (shared && result.resetOK) {
 		const uint8_t sibling=type==renderType ? computeType : renderType;
 		result.siblingType=sibling;

@@ -322,6 +322,20 @@ uint64_t tglRecoveryRecords[16][tglRecoveryWords] {};
 TGLRecovery::Domain tglRecoveryDomain;
 TGLRecovery::ForceWake tglRecoveryForceWake {};
 TGLRecovery::SubmitStamp tglRecoverySubmitStamp {};
+// Exact donor IGMemoryManager::initCache (vtable slot 0x120 of the owner's
+// memory manager at +1260). Null when unresolved or -wex-tgl-no-l3reinit.
+uintptr_t tglInitCache {};
+uint32_t tglInitCacheRuns {};
+bool tglReinitCache(void *owner) {
+	if (!tglInitCache || !owner) return false;
+	void *manager=TGLRecovery::field<void *>(owner,0x1260);
+	if (!manager || TGLRecovery::field<void *>(manager,0x10)!=owner) return false;
+	auto vtable=TGLRecovery::field<uintptr_t *>(manager,0);
+	if (!vtable || vtable[0x120/8]!=tglInitCache) return false;
+	reinterpret_cast<void (*)(void *)>(tglInitCache)(manager);
+	__atomic_fetch_add(&tglInitCacheRuns,1,__ATOMIC_RELAXED);
+	return true;
+}
 bool tglRecoveryDomainTried {false};
 TGLResetTrace::Ring tglResetTrace;
 bool tglDisplaySyncSerialize(void *,void *,OSSerialize *serializer);
@@ -434,7 +448,7 @@ void XE::wrapTGLRecovery(void *channel) {
 			SYSLOG("igfx","TGL render-domain reset list unavailable; native single-ring restore kept");
 	}
 	const auto result=TGLRecovery::resetAndResume(channel,&tglRecoveryDomain,tglRecoveryForceWake,
-		tglRecoverySubmitStamp);
+		tglRecoverySubmitStamp,tglReinitCache);
 	tglHangFinish(channel);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
@@ -443,7 +457,7 @@ void XE::wrapTGLRecovery(void *channel) {
 		q[6]=result.context;q[7]=result.affected;q[8]=result.index;
 		q[9]=result.failuresBefore;q[10]=result.failuresAfter;q[11]=result.resetOK;
 		q[12]=result.type|static_cast<uint64_t>(result.siblingType)<<8;
-		q[13]=result.domainList|static_cast<uint64_t>(result.siblingReset)<<1;
+		q[13]=result.domainList|static_cast<uint64_t>(result.siblingReset)<<1|static_cast<uint64_t>(result.cacheReinit)<<2;
 		q[14]=tglRecoveryDomain.ready ? tglRecoveryDomain.merged.count : 0;
 		q[15]=result.siblingIndex|static_cast<uint64_t>(result.stampsAppended)<<32;
 		// Per engine (RCS q16..22, CCS q23..29): port, then for each port/element
@@ -12459,6 +12473,18 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					}
 				}
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryRenderDomainReady",domainOK);
+				// Native cache/L3 re-init after GDRST (see TGLRecovery::ReinitCache).
+				// Exact donor entry; it takes its own SafeForceWake(…,5) pair.
+				bool cacheOK=false;
+				if (domainOK && !checkKernelArgument("-wex-tgl-no-l3reinit")) {
+					const auto init=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN15IGMemoryManager9initCacheEv",address,size);
+					const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x49,0x89,0xFE,0x31,0xFF};
+					cacheOK=init==address+0xFE1A && size>0xFF56 &&
+						!memcmp(reinterpret_cast<void *>(init),head,sizeof(head));
+					if (cacheOK) tglInitCache=init;
+				}
+				patcher.clearError();
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryCacheReinitReady",cacheOK);
 				// Native completion stamp (resetHardwareAndReplay 4CA79..4CA97):
 				// owner(+18)->events(+380)->vtable1D8(index +20), then
 				// submitStampCommand. Qualify the exact sequence and callee.

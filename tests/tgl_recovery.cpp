@@ -125,6 +125,12 @@ void buildCases() {
 }
 }
 
+static unsigned reinitCalls;static bool reinitOrderOK,reinitAnswer;static void *reinitOwner;
+static bool reinit(void *o) {
+	++reinitCalls;reinitOwner=o;
+	if (resets!=1 || siblings!=0 || resumes!=0) reinitOrderOK=false;
+	return reinitAnswer;
+}
 int main() {
 	// Original contract, no domain: identical native single-ring behavior.
 	unsigned cases=0;
@@ -157,8 +163,14 @@ int main() {
 		if (present) TGLRecovery::field<void *>(s,0xCA0+sibling*8u)=siblingStreamer;
 		expectedList=&nativeRing;
 		const bool shared=mask==2 && type<2 && !flags;
-		const auto result=TGLRecovery::resetAndResume(channel,&domain,forceWake);
+		reinitCalls=0;reinitOrderOK=true;reinitOwner=nullptr;reinitAnswer=!present;
+		const auto result=TGLRecovery::resetAndResume(channel,&domain,forceWake,nullptr,reinit);
 		assert(resets==1 && resumes==1 && wakeDepth==0);
+		// Native cache/L3 re-init: only after a successful shared GDRST, with the
+		// engines idle (after reset, before sibling replay and scheduler resume).
+		assert(reinitCalls==unsigned(shared && ok) && reinitOrderOK);
+		if (reinitCalls) assert(reinitOwner==owner && result.cacheReinit==reinitAnswer);
+		else assert(!result.cacheReinit);
 		// The merged list is visible ONLY during native reset, then restored.
 		assert(listDuringReset==(shared ? static_cast<void *>(&domain.merged) : static_cast<void *>(&nativeRing)));
 		assert(TGLRecovery::field<void *>(ring,0x78)==&nativeRing);

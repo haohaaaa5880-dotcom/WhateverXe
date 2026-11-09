@@ -63,6 +63,7 @@ struct KernelPatcher {
  void routeBlock(uintptr_t,const uint8_t*,size_t){}
  void clearError(){error=Error::NoError;}
 };
+unsigned metalLeakInstalls=0;void installMetalLeakFix(KernelPatcher &){++metalLeakInstalls;} // tests/tgl_metal_leak.py
 namespace XeDataAccess {bool processKext(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}void processKernel(KernelPatcher &){assert(published);events.push_back(7);}}
 struct Graphics:KernelPatcher::KextInfo {Graphics(size_t i=4){loadIndex=i;id="com.apple.iokit.IOGraphicsFamily";}bool off=false;void switchOff(){off=true;}} graphics;
 KernelPatcher::KextInfo surface{"com.apple.iokit.IOSurface",6},backlight{"com.apple.driver.AppleBacklight",5},accelFamily{"com.apple.iokit.IOAcceleratorFamily2",7},kextAppleIntelTGLCompat{"org.b00t0x.AppleIntelTGLCompat",3};
@@ -255,7 +256,8 @@ for(unsigned firmware=0;firmware<2;++firmware)for(unsigned me=0;me<5;++me)for(un
  DeviceInfo::value.firmwareVendor=firmware?DeviceInfo::FirmwareVendor::Apple:DeviceInfo::FirmwareVendor::Other;
  events.clear();published=false;publish=test!=1;identity=(test==2 || test>=4)?0x12348086:0x9a498086;deviceProperty=test>=4?&fake:nullptr;fake.value=test==4?0x46D2:0xFFFF;graphics.off=false;
  hasModel=test==3;modelWrites=0;
- DeviceInfo::value.videoBuiltin=test==0?nullptr:&gpu;XeHost host;host.processKernel(patcher);
+ DeviceInfo::value.videoBuiltin=test==0?nullptr:&gpu;XeHost host;metalLeakInstalls=0;host.processKernel(patcher);
+ assert(metalLeakInstalls==(host.active?1U:0U)); // only an admitted GPU routes cs_validate_range
  assert(host.backlightEnabled==((test==3 || test==4) && !firmware));
  const bool normalize=(test==3 || test==4) && me!=4;
  assert(mei.renames==(normalize && me!=1?1U:0U));

@@ -34,6 +34,58 @@ static const char *backlightPath[] { "/System/Library/Extensions/AppleBacklight.
 static KernelPatcher::KextInfo backlight { "com.apple.driver.AppleBacklight",backlightPath,arrsize(backlightPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 static const char *surfacePath[] { "/System/Library/Extensions/IOSurface.kext/Contents/MacOS/IOSurface" };
 static KernelPatcher::KextInfo surface { "com.apple.iokit.IOSurface",surfacePath,arrsize(surfacePath),{true},{},KernelPatcher::KextInfo::Unloaded };
+// Graphics Metal driver leak (b00t0x/WhateverXe#47). -[MTLIGAccelCommandBuffer
+// dealloc] (AppleIntelTGLGraphicsMTLDriver 16.0.32, 0x7ECBA) skips operator
+// delete of _pPoshUsedAsTarget when m_isOnlyActiveCommandBuffer is set,
+// assuming the queue's shared buffer, but MTLIGAccelCommandQueue.
+// m_pPoshUsedAsTarget is never assigned: every such command buffer leaks a
+// 0x12010-byte buffer (WindowServer ~70 MB/min). Drop the jne at 0x7ED87
+// (75 0D -> 90 90) so the private buffer is freed.
+// The bundle lives on the Data volume, which is not mounted when Lilu's user
+// patcher reads its files, so patch the page right after cs_validate_range
+// accepts it (same point and write method as Lilu's own user patcher; Lilu
+// chains its later long route on top). A page qualifies only when 48 exact
+// bytes match at page offset 0xD70. The file on disk and its signature stay
+// untouched. Opt-out: -wex-tgl-no-mtlleakfix.
+namespace {
+constexpr size_t metalLeakPageOffset=0xD70,metalLeakJne=0x17;
+const uint8_t metalLeakContext[48] {
+ 0x41,0x00,0x49,0x8B,0x3C,0x1E,0x48,0x85,0xFF,0x74,0x1B,0x48,0x8B,0x05,0x26,0xB1,
+ 0x41,0x00,0x41,0x80,0x3C,0x06,0x00,0x75,0x0D,0xE8,0x7A,0xFA,0x01,0x00,0x49,0xC7,
+ 0x04,0x1E,0x00,0x00,0x00,0x00,0x48,0x8B,0x15,0xEB,0xB0,0x41,0x00,0x4C,0x01,0xF2};
+mach_vm_address_t metalLeakOriginal {};
+uint32_t metalLeakPatched {};
+boolean_t metalLeakValidateRange(void *blobs,memory_object_t pager,memory_object_offset_t offset,const void *data,
+ memory_object_size_t size,unsigned *tainted) {
+ const boolean_t ok=FunctionCast(metalLeakValidateRange,metalLeakOriginal)(blobs,pager,offset,data,size,tainted);
+ if(!ok || !data)return ok;
+ for(memory_object_size_t at=0;at+PAGE_SIZE<=size;at+=PAGE_SIZE) {
+  auto page=static_cast<const uint8_t *>(data)+at;
+  if(page[metalLeakPageOffset+metalLeakJne]!=0x75 || page[metalLeakPageOffset+metalLeakJne+1]!=0x0D ||
+     memcmp(page+metalLeakPageOffset,metalLeakContext,sizeof(metalLeakContext)))continue;
+  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)continue;
+  auto jne=const_cast<uint8_t *>(page+metalLeakPageOffset+metalLeakJne);
+  jne[0]=0x90;jne[1]=0x90;
+  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
+  __atomic_fetch_add(&metalLeakPatched,1,__ATOMIC_RELAXED);
+ }
+ return ok;
+}
+bool metalLeakSerialize(void *,void *,OSSerialize *serializer) {
+ const uint32_t out[2] {1,__atomic_load_n(&metalLeakPatched,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+void installMetalLeakFix(KernelPatcher &patcher) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(checkKernelArgument("-wex-tgl-no-mtlleakfix")) {root->setProperty("TGLMetalLeakFixReady",false);return;}
+ KernelPatcher::RouteRequest route {"_cs_validate_range",metalLeakValidateRange,metalLeakOriginal};
+ const bool ok=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1);
+ patcher.clearError();
+ root->setProperty("TGLMetalLeakFixReady",ok);
+ if(ok)if(auto live=OSSerializer::forTarget(nullptr,metalLeakSerialize)) {root->setProperty("TGLMetalLeakFixLive",live);live->release();}
+}
+}
 void XeHost::init() {
  callbackHost=this;
  PE_parse_boot_argn("gfxrst",&resetFramebuffer,sizeof(resetFramebuffer));
@@ -56,6 +108,7 @@ void XeHost::processKernel(KernelPatcher &patcher) {
  // The host must dispatch framebuffer patches and accelerator rejection
  // hooks even when the selected profile deliberately has no Render backend.
  active=profile.displayAdmitted();
+ if(active)installMetalLeakFix(patcher);
 
  const auto display=XELP::displayAdapter(profile.family);
  systemWakeRecovery=active && (display==XELP::DisplayAdapter::ADLP || display==XELP::DisplayAdapter::ADLN);

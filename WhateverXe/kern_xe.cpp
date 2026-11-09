@@ -4028,37 +4028,8 @@ extern "C" __attribute__((naked, used)) void tglGuCDMAWriteBridge() {
 		"jmpq *_tglGuCDMAWriteResume(%rip)\n");
 }
 
-// Graphics Metal driver leak (b00t0x/WhateverXe#47). -[MTLIGAccelCommandBuffer
-// dealloc] skips operator delete of _pPoshUsedAsTarget when
-// m_isOnlyActiveCommandBuffer is set, assuming it is the queue's shared
-// buffer, but MTLIGAccelCommandQueue.m_pPoshUsedAsTarget is never assigned, so
-// every such command buffer allocated a private 0x12010-byte buffer that is
-// never freed (~72 KB per command buffer; WindowServer grows ~70 MB/min).
-// Drop the jne at 0x7ED87 (75 0D -> 90 90) so the private buffer is freed.
-// The on-disk bundle stays untouched and signed: Lilu patches the page in
-// memory after cs_validate_page, only when the whole 4 KiB page equals the
-// exact 16.0.32 page. Opt-out: -wex-tgl-no-mtlleakfix.
-namespace {
-// cmpb $0,(%r14,%rax); jne +0xd; call operator delete; movq $0,(%r14,%rbx)
-const uint8_t tglMetalLeakFind[] {0x41,0x80,0x3C,0x06,0x00,0x75,0x0D,0xE8,0x7A,0xFA,0x01,0x00,0x49,0xC7,0x04,0x1E};
-const uint8_t tglMetalLeakRepl[] {0x41,0x80,0x3C,0x06,0x00,0x90,0x90,0xE8,0x7A,0xFA,0x01,0x00,0x49,0xC7,0x04,0x1E};
-UserPatcher::BinaryModPatch tglMetalLeakPatch {CPU_TYPE_X86_64,0,tglMetalLeakFind,tglMetalLeakRepl,
-	sizeof(tglMetalLeakFind),0,1,UserPatcher::FileSegment::SegmentTextText,1};
-UserPatcher::BinaryModInfo tglMetalLeakMod {
-	"/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle/Contents/MacOS/AppleIntelTGLGraphicsMTLDriver",
-	&tglMetalLeakPatch,1};
-UserPatcher::ProcInfo tglMetalLeakProc {"/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
-	sizeof("/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer")-1,1};
-}
-static void tglRegisterMetalLeakFix() {
-	if (checkKernelArgument("-wex-tgl-no-mtlleakfix")) return;
-	const auto err=lilu.onProcLoad(&tglMetalLeakProc,1,nullptr,nullptr,&tglMetalLeakMod,1);
-	if (err!=LiluAPI::Error::NoError) SYSLOG("igfx","TGL Metal leak fix not registered (%d)",static_cast<int>(err));
-}
-
 void XE::init() {
     callbackXE = this;
-    tglRegisterMetalLeakFix();
     // Register notifications before Lilu closes registration. Actual family
     // selection waits for published PCI config space in processKernel.
     lilu.onKextLoadForce(&kextAppleIntelTGLCompat);

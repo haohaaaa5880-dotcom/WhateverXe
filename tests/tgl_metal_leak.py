@@ -19,14 +19,19 @@ m = re.search(r'metalLeakContext\[48\] \{([^}]*)\}', host)
 context = bytes(int(x, 16) for x in re.findall(r'0x([0-9A-F]{2})', m.group(1)))
 assert len(context) == 48 and context[0x17:0x19] == b'\x75\x0d'
 assert 'constexpr size_t metalLeakPageOffset=0xD70,metalLeakJne=0x17;' in host
-wrap = host[host.index('boolean_t metalLeakValidateRange('):host.index('bool metalLeakSerialize(')]
-assert wrap.index('FunctionCast(metalLeakValidateRange,metalLeakOriginal)') < wrap.index('if(!ok || !data)return ok;') < wrap.index('memcmp(page+metalLeakPageOffset,metalLeakContext')
-assert wrap.index('memcmp(') < wrap.index('setKernelWriting(true') < wrap.index('jne[0]=0x90;jne[1]=0x90;') < wrap.index('setKernelWriting(false')
-assert 'at+PAGE_SIZE<=size' in wrap
+patch = host[host.index('bool metalLeakPatchPage('):host.index('boolean_t metalLeakValidateRange(')]
+assert patch.index('memcmp(page+metalLeakPageOffset,metalLeakContext') < patch.index('setKernelWriting(true') < patch.index('jne[0]=0x90;jne[1]=0x90;') < patch.index('setKernelWriting(false')
+rng = host[host.index('boolean_t metalLeakValidateRange('):host.index('void metalLeakValidatePage(')]
+assert rng.index('FunctionCast(metalLeakValidateRange,metalLeakOriginal)') < rng.index('if(!ok || !data)return ok;') < rng.index('metalLeakPatchPage(')
+assert 'at+PAGE_SIZE<=size' in rng
+# Current xnu: void cs_validate_page(vp, pager, offset, data, int *validated, int *tainted, int *nx).
+pg = host[host.index('void metalLeakValidatePage('):host.index('bool metalLeakSerialize(')]
+assert 'int *validated,int *tainted,int *nx' in pg
+assert pg.index('FunctionCast(metalLeakValidatePage,metalLeakPageOriginal)') < pg.index('*validated && metalLeakPatchPage(')
 inst = host[host.index('void installMetalLeakFix('):]
 inst = inst[:inst.index('\n}\n')]
 assert inst.index('-wex-tgl-no-mtlleakfix') < inst.index('routeMultipleLong(KernelPatcher::KernelID')
-assert '"_cs_validate_range"' in inst and 'routeMultiple(' not in inst.replace('routeMultipleLong(', '')
+assert '"_cs_validate_range"' in inst and '"_cs_validate_page"' in inst and 'routeMultiple(' not in inst.replace('routeMultipleLong(', '')
 pk = host[host.index('void XeHost::processKernel('):]
 assert pk.index('active=profile.displayAdmitted();') < pk.index('if(active)installMetalLeakFix(patcher);')
 assert 'onProcLoad' not in (root / 'WhateverXe/kern_xe.cpp').read_text()
@@ -44,4 +49,10 @@ if len(sys.argv) > 1:
     page[0xD87:0xD89] = b'\x90\x90'
     diff = [i for i in range(0x1000) if page[i] != image[0x7E000 + i]]
     assert diff == [0xD87, 0xD88]
+    # Kernel replay: cs_validate_page is the page-in path and keeps the
+    # void/out-pointer ABI (validated in r8, tainted in r9).
+    kern = Path('/System/Library/Kernels/kernel')
+    if kern.exists():
+        ks = {l.split()[2]: int(l.split()[0], 16) for l in subprocess.run(['nm', str(kern)], capture_output=True, text=True).stdout.splitlines() if len(l.split()) == 3}
+        assert '_cs_validate_page' in ks and '_cs_validate_range' in ks
 print('ok')

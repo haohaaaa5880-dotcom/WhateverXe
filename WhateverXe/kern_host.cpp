@@ -55,34 +55,53 @@ const uint8_t metalLeakContext[48] {
  0x04,0x1E,0x00,0x00,0x00,0x00,0x48,0x8B,0x15,0xEB,0xB0,0x41,0x00,0x4C,0x01,0xF2};
 mach_vm_address_t metalLeakOriginal {};
 uint32_t metalLeakPatched {};
+mach_vm_address_t metalLeakPageOriginal {};
+uint32_t metalLeakPagePatched {};
+bool metalLeakPatchPage(const uint8_t *page) {
+ if(page[metalLeakPageOffset+metalLeakJne]!=0x75 || page[metalLeakPageOffset+metalLeakJne+1]!=0x0D ||
+    memcmp(page+metalLeakPageOffset,metalLeakContext,sizeof(metalLeakContext)))return false;
+ if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return false;
+ auto jne=const_cast<uint8_t *>(page+metalLeakPageOffset+metalLeakJne);
+ jne[0]=0x90;jne[1]=0x90;
+ MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
+ return true;
+}
+// Chunked path (vm_page_validate_cs_mapped_chunk). Lilu chains on top of it.
 boolean_t metalLeakValidateRange(void *blobs,memory_object_t pager,memory_object_offset_t offset,const void *data,
  memory_object_size_t size,unsigned *tainted) {
  const boolean_t ok=FunctionCast(metalLeakValidateRange,metalLeakOriginal)(blobs,pager,offset,data,size,tainted);
  if(!ok || !data)return ok;
- for(memory_object_size_t at=0;at+PAGE_SIZE<=size;at+=PAGE_SIZE) {
-  auto page=static_cast<const uint8_t *>(data)+at;
-  if(page[metalLeakPageOffset+metalLeakJne]!=0x75 || page[metalLeakPageOffset+metalLeakJne+1]!=0x0D ||
-     memcmp(page+metalLeakPageOffset,metalLeakContext,sizeof(metalLeakContext)))continue;
-  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)continue;
-  auto jne=const_cast<uint8_t *>(page+metalLeakPageOffset+metalLeakJne);
-  jne[0]=0x90;jne[1]=0x90;
-  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
-  __atomic_fetch_add(&metalLeakPatched,1,__ATOMIC_RELAXED);
- }
+ for(memory_object_size_t at=0;at+PAGE_SIZE<=size;at+=PAGE_SIZE)
+  if(metalLeakPatchPage(static_cast<const uint8_t *>(data)+at))__atomic_fetch_add(&metalLeakPatched,1,__ATOMIC_RELAXED);
  return ok;
 }
+// Page-in path on current kernels (vm_page_validate_cs_mapped_slow,
+// vm_page_validate_cs -> 0x32E330, vm_page_push_to_copy): void, results via
+// validated/tainted/nx out pointers. Patch only a page reported validated.
+void metalLeakValidatePage(void *vnode,memory_object_t pager,memory_object_offset_t offset,const void *data,
+ int *validated,int *tainted,int *nx) {
+ FunctionCast(metalLeakValidatePage,metalLeakPageOriginal)(vnode,pager,offset,data,validated,tainted,nx);
+ if(data && validated && *validated && metalLeakPatchPage(static_cast<const uint8_t *>(data)))
+  __atomic_fetch_add(&metalLeakPagePatched,1,__ATOMIC_RELAXED);
+}
 bool metalLeakSerialize(void *,void *,OSSerialize *serializer) {
- const uint32_t out[2] {1,__atomic_load_n(&metalLeakPatched,__ATOMIC_RELAXED)};
+ const uint32_t out[3] {2,__atomic_load_n(&metalLeakPatched,__ATOMIC_RELAXED),
+  __atomic_load_n(&metalLeakPagePatched,__ATOMIC_RELAXED)};
  auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 void installMetalLeakFix(KernelPatcher &patcher) {
  auto root=IORegistryEntry::getRegistryRoot();
  if(checkKernelArgument("-wex-tgl-no-mtlleakfix")) {root->setProperty("TGLMetalLeakFixReady",false);return;}
- KernelPatcher::RouteRequest route {"_cs_validate_range",metalLeakValidateRange,metalLeakOriginal};
- const bool ok=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1);
+ KernelPatcher::RouteRequest range {"_cs_validate_range",metalLeakValidateRange,metalLeakOriginal};
+ const bool rangeOK=patcher.routeMultipleLong(KernelPatcher::KernelID,&range,1);
  patcher.clearError();
+ KernelPatcher::RouteRequest page {"_cs_validate_page",metalLeakValidatePage,metalLeakPageOriginal};
+ const bool pageOK=patcher.routeMultipleLong(KernelPatcher::KernelID,&page,1);
+ patcher.clearError();
+ const bool ok=rangeOK || pageOK;
  root->setProperty("TGLMetalLeakFixReady",ok);
+ root->setProperty("TGLMetalLeakFixPageRoute",pageOK);
  if(ok)if(auto live=OSSerializer::forTarget(nullptr,metalLeakSerialize)) {root->setProperty("TGLMetalLeakFixLive",live);live->release();}
 }
 }

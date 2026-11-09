@@ -339,7 +339,11 @@ bool tglResetTraceSerialize(void *,void *,OSSerialize *serializer) {
 // 32 ring dwords before the hardware head. No writes, no donor calls.
 // q0 uptime, q1 channel|type<<32|flags<<40, q2..10 register pairs, q11..50 LRC
 // state dwords 0x1000..0x113F, q51..66 ring, q67 ok|seq<<8|mask<<32, q68 ready.
-constexpr unsigned tglHangWords=69, tglHangRecords=8;
+constexpr unsigned tglHangWords=74, tglHangRecords=8;
+// q69..72: pre|post<<32 of RPNSWREQ A008, RPSTAT1 1381B4 (CAGF 19:11), RP_CONTROL
+// A024, RC_STATE A094; q73 ready. Units: 16.67 MHz (Gen9+ frequency ratio).
+constexpr uint32_t tglHangFreqRegs[4] {0xA008,0x1381B4,0xA024,0xA094};
+uint64_t *tglHangLastRecord {};
 constexpr uint32_t tglHangRegs[18] {0x2030,0x2034,0x2038,0x203C,0x2064,0x2068,0x206C,0x2074,
 	0x2110,0x2140,0x2168,0x2244,0x209C,0x2234,0x2238,0x23A0,0x2050,0x44050};
 uint64_t tglHangRecord[tglHangRecords][tglHangWords] {};
@@ -355,6 +359,7 @@ void tglHangCapture(void *channel) {
 		auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(bar+r);};
 		for (unsigned i=0;i<18;i+=2) q[2+i/2]=rd(tglHangRegs[i])|static_cast<uint64_t>(rd(tglHangRegs[i+1]))<<32;
 		head=static_cast<uint32_t>(q[2]>>32);ok|=1;
+		for (unsigned i=0;i<4;++i) q[69+i]=rd(tglHangFreqRegs[i]);
 	}
 	void *ring=TGLRecovery::field<void *>(channel,0x130);
 	void *ctx=ring ? TGLRecovery::field<void *>(ring,0x20) : nullptr;
@@ -376,7 +381,16 @@ void tglHangCapture(void *channel) {
 		ok|=4;
 	}
 	q[67]=ok|static_cast<uint64_t>(n+1)<<8|static_cast<uint64_t>(mask)<<32;
-	__atomic_store_n(&q[68],1,__ATOMIC_RELEASE);
+	tglHangLastRecord=q;
+}
+// After the native reset and replay: post-reset frequency samples, then publish.
+void tglHangFinish(void *channel) {
+	auto q=tglHangLastRecord;if (!q) return;tglHangLastRecord=nullptr;
+	void *accel=TGLRecovery::field<void *>(channel,0x18);
+	auto bar=accel ? TGLRecovery::field<volatile uint8_t *>(accel,0x1240) : nullptr;
+	if (bar) for (unsigned i=0;i<4;++i)
+		q[69+i]|=static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(bar+tglHangFreqRegs[i]))<<32;
+	__atomic_store_n(&q[73],1,__ATOMIC_RELEASE);
 }
 bool tglHangSerialize(void *,void *,OSSerialize *serializer) {
 	const uint64_t head[4] {1,__atomic_load_n(&tglHangCount,__ATOMIC_ACQUIRE),tglHangRecords,tglHangWords};
@@ -421,6 +435,7 @@ void XE::wrapTGLRecovery(void *channel) {
 	}
 	const auto result=TGLRecovery::resetAndResume(channel,&tglRecoveryDomain,tglRecoveryForceWake,
 		tglRecoverySubmitStamp);
+	tglHangFinish(channel);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
 		auto q=tglRecoveryRecords[n];q[0]=125;q[1]=n+1;q[2]=before;q[3]=after;
@@ -11403,6 +11418,62 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+// GT frequency floor. Without GuC/SLPC (-disablegfxfirmware) the donor's
+// power query fails and IGHardwareCommandStreamer5::setGTFrequencyMMIO writes
+// RPNSWREQ (A008) = 0 on every submission (submitExecList 3A70A..3A74D and the
+// change-frequency timer). The GT then only runs fast because the hardware
+// raises the clock by itself; after a GDRST it stays at RPn (~100 MHz), every
+// WindowServer frame misses the progress timeout and the resets chain.
+// Same finding and fix on real TGL: joaovitoraramo/NootedGreen-NP550XDA
+// (XE-GTFREQ, JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe#29).
+// A request of 0 becomes 1500 MHz (the hardware clamps to RP0); non-zero
+// requests pass unchanged. Opt-out: -wex-tgl-no-gtfreq.
+namespace {
+uintptr_t tglGTFreqOriginal {};
+uint32_t tglGTFreqFloor {};       // RPNSWREQ value, 0 = off
+uint32_t tglGTFreqCounts[4] {};   // calls, zero requests raised, last in, last out
+void tglGTFreqSet(void *streamer,uint32_t value) {
+ __atomic_fetch_add(&tglGTFreqCounts[0],1,__ATOMIC_RELAXED);
+ __atomic_store_n(&tglGTFreqCounts[2],value,__ATOMIC_RELAXED);
+ if (!value && tglGTFreqFloor) { value=tglGTFreqFloor;__atomic_fetch_add(&tglGTFreqCounts[1],1,__ATOMIC_RELAXED); }
+ __atomic_store_n(&tglGTFreqCounts[3],value,__ATOMIC_RELAXED);
+ FunctionCast(tglGTFreqSet,tglGTFreqOriginal)(streamer,value);
+}
+bool tglGTFreqSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[6] {1,tglGTFreqFloor};
+ for (unsigned i=0;i<4;++i) out[2+i]=__atomic_load_n(&tglGTFreqCounts[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+}
+static void tglInstallGTFreqFloor(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-no-gtfreq")) { root->setProperty("TGLGTFreqFloorReady",false);return; }
+ const uint32_t ratio=1500*3/50;  // 1500 MHz as Gen9+ RPNSWREQ ratio (16.67 MHz units, bits 31:23)
+ const char *symbol="__ZN26IGHardwareCommandStreamer518setGTFrequencyMMIOEj";
+ // push rbp; mov rbp,rsp; push r15/r14/r12/rbx; sub rsp,0x10; mov r14d,esi; mov r15,rdi
+ static const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x10,
+  0x41,0x89,0xF6,0x49,0x89,0xFF};
+ // ... mov rcx,[rcx+0x1240]; mov [rcx+0xA008],r14d
+ static const uint8_t store[] {0x48,0x8B,0x89,0x40,0x12,0x00,0x00,0x44,0x89,0xB1,0x08,0xA0,0x00,0x00};
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
+ bool ready=size>0x3BFE0 && fn==address+0x3BF6E &&
+  !memcmp(reinterpret_cast<void *>(fn),head,sizeof(head)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x3BFBF),store,sizeof(store));
+ patcher.clearError();
+ if (ready) {
+  tglGTFreqFloor=ratio<<23;
+  KernelPatcher::RouteRequest route(symbol,tglGTFreqSet,tglGTFreqOriginal);
+  ready=patcher.routeMultiple(index,&route,1,address,size);
+  if (!ready) tglGTFreqFloor=0;
+  patcher.clearError();
+ }
+ root->setProperty("TGLGTFreqFloorReady",ready);
+ if (ready) if (auto live=OSSerializer::forTarget(nullptr,tglGTFreqSerialize)) {
+  root->setProperty("TGLGTFreqLive",live);live->release();
+ }
+}
+
 // Hardware encode admission (see kern_tgl_encode_guard.hpp). Counters are
 // relaxed statistics only; rejection never depends on them.
 namespace {
@@ -11508,6 +11579,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  tglEncodeGuardReady=tglInstallEncodeGuard(patcher,index,address,size);
  tglInstallContextOwners(patcher,index,address,size);
+ tglInstallGTFreqFloor(patcher,index,address,size);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.

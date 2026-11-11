@@ -85,6 +85,7 @@
 #include "kern_tgl_encode_guard.hpp"
 #include "kern_tgl_reset_trace.hpp"
 #include "kern_tgl_context_owners.hpp"
+#include "kern_tgl_orphan_stamp.hpp"
 #include <sys/proc.h>
 #include "kern_tgl_aux_call.hpp"
 
@@ -11560,6 +11561,86 @@ static void tglInstallGTFreqFloor(KernelPatcher &patcher,size_t index,mach_vm_ad
  }
 }
 
+// Orphaned-stamp retirement (see kern_tgl_orphan_stamp.hpp). eventTimeout is
+// only acted on while restart_channel works on that same index; the reason
+// is taken from the donor's own encodeDebugInfo call on this thread.
+// Opt-out: -wex-tgl-no-orphanstamp.
+namespace {
+uintptr_t tglOrphanTimeoutOriginal {}, tglOrphanReasonOriginal {};
+uintptr_t tglOrphanCaptureThread {};
+uint32_t tglOrphanReason {};
+int tglOrphanLayout {};  // 0 unchecked, 1 known, -1 unknown
+uint32_t tglOrphanRecord[TGLOrphanStamp::recordWords] {1};
+void tglOrphanReasonCapture(void *accelerator,uint32_t reason) {
+ if (__atomic_load_n(&tglOrphanCaptureThread,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(current_thread()))
+  tglOrphanReason=reason;
+ FunctionCast(tglOrphanReasonCapture,tglOrphanReasonOriginal)(accelerator,reason);
+}
+bool tglOrphanLayoutKnown(void *machine) {
+ if (!tglOrphanLayout) {
+  auto vt=*reinterpret_cast<void *const *const *>(machine);
+  tglOrphanLayout=vt && TGLOrphanStamp::layoutKnown(vt[TGLOrphanStamp::slotCheckGPUProgress],
+   vt[TGLOrphanStamp::slotSignalStamp],vt[TGLOrphanStamp::slotDeviceTerminated])?1:-1;
+ }
+ return tglOrphanLayout>0;
+}
+void *tglOrphanEventTimeout(void *machine,int index) {
+ if (!TGLOrphanStamp::restartingIndex(machine,index))
+  return FunctionCast(tglOrphanEventTimeout,tglOrphanTimeoutOriginal)(machine,index);
+ const auto self=reinterpret_cast<uintptr_t>(current_thread());
+ tglOrphanReason=UINT32_MAX;
+ __atomic_store_n(&tglOrphanCaptureThread,self,__ATOMIC_RELAXED);
+ void *channel=FunctionCast(tglOrphanEventTimeout,tglOrphanTimeoutOriginal)(machine,index);
+ __atomic_store_n(&tglOrphanCaptureThread,0,__ATOMIC_RELAXED);
+ const bool layout=!channel && tglOrphanReason==TGLOrphanStamp::reasonNoContext && tglOrphanLayoutKnown(machine);
+ const auto r=TGLOrphanStamp::retire(machine,index,channel,tglOrphanReason,layout);
+ __atomic_fetch_add(&tglOrphanRecord[1+static_cast<uint32_t>(r.outcome)],1,__ATOMIC_RELAXED);
+ if (r.outcome==TGLOrphanStamp::Outcome::Retired) {
+  __atomic_store_n(&tglOrphanRecord[1+TGLOrphanStamp::outcomes],static_cast<uint32_t>(index),__ATOMIC_RELAXED);
+  __atomic_store_n(&tglOrphanRecord[2+TGLOrphanStamp::outcomes],r.submitted-r.returned,__ATOMIC_RELAXED);
+  auto vt=*reinterpret_cast<void *const *const *>(machine);
+  reinterpret_cast<void (*)(void *,int,uint32_t)>(vt[TGLOrphanStamp::slotSignalStamp])(machine,index,0);
+  SYSLOG("igfx","TGL retired orphaned stamp index %d (%u -> %u)",index,r.returned,r.submitted);
+ }
+ return channel;
+}
+bool tglOrphanSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[TGLOrphanStamp::recordWords];
+ for (unsigned i=0;i<TGLOrphanStamp::recordWords;++i) out[i]=__atomic_load_n(&tglOrphanRecord[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+}
+static void tglInstallOrphanStamp(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-no-orphanstamp")) { root->setProperty("TGLOrphanStampReady",false);return; }
+ const char *timeoutSymbol="__ZN19IGAccelEventMachine12eventTimeoutEi";
+ const char *reasonSymbol="__ZN16IntelAccelerator15encodeDebugInfoE15IGTimeoutReason";
+ const auto timeout=patcher.solveSymbol<mach_vm_address_t>(index,timeoutSymbol,address,size);
+ patcher.clearError();
+ const auto reason=patcher.solveSymbol<mach_vm_address_t>(index,reasonSymbol,address,size);
+ patcher.clearError();
+ bool ready=size>TGLOrphanStamp::encodeDebugInfoEntry+sizeof(TGLOrphanStamp::encodeDebugInfoPrologue) &&
+  timeout==address+TGLOrphanStamp::eventTimeoutEntry && reason==address+TGLOrphanStamp::encodeDebugInfoEntry &&
+  !memcmp(reinterpret_cast<void *>(timeout),TGLOrphanStamp::eventTimeoutPrologue,sizeof(TGLOrphanStamp::eventTimeoutPrologue)) &&
+  !memcmp(reinterpret_cast<void *>(reason),TGLOrphanStamp::encodeDebugInfoPrologue,sizeof(TGLOrphanStamp::encodeDebugInfoPrologue));
+ if (ready) {
+  // Reason capture first: an eventTimeout route without it would only ever see UINT32_MAX.
+  KernelPatcher::RouteRequest capture(reasonSymbol,tglOrphanReasonCapture,tglOrphanReasonOriginal);
+  ready=patcher.routeMultiple(index,&capture,1,address,size);
+  patcher.clearError();
+  if (ready) {
+   KernelPatcher::RouteRequest route(timeoutSymbol,tglOrphanEventTimeout,tglOrphanTimeoutOriginal);
+   ready=patcher.routeMultiple(index,&route,1,address,size);
+   patcher.clearError();
+  }
+ }
+ root->setProperty("TGLOrphanStampReady",ready);
+ if (ready) if (auto live=OSSerializer::forTarget(nullptr,tglOrphanSerialize)) {
+  root->setProperty("TGLOrphanStampLive",live);live->release();
+ }
+}
+
 // Hardware encode admission (see kern_tgl_encode_guard.hpp). Counters are
 // relaxed statistics only; rejection never depends on them.
 namespace {
@@ -11666,6 +11747,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  tglEncodeGuardReady=tglInstallEncodeGuard(patcher,index,address,size);
  tglInstallContextOwners(patcher,index,address,size);
  tglInstallGTFreqFloor(patcher,index,address,size);
+ tglInstallOrphanStamp(patcher,index,address,size);
  tglInstallPOSHOff(patcher,address,size);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original

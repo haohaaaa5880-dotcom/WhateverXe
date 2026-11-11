@@ -85,6 +85,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - `-wex-tgl-posh`: keep position-only shading (POSH) paired contexts for Tiger Lake Metal graphics. They are disabled by default because they stall the render engine.
 - `-wex-tgl-no-poshfix`: do not repair the POSH fields (CTX_CTRL bit 4, POSH_LRCA) of a Tiger Lake render context after the native reset reloads the golden image.
 - `-wex-tgl-no-mtlleakfix`: do not patch (in memory, after code-signature validation) the Graphics Metal driver command-buffer leak (#47), where every command buffer leaks about 72 KB and WindowServer grows without bound.
+- `-wex-tgl-no-orphanstamp`: do not retire Tiger Lake stamps left orphaned by a GPU reset. By default, when the native timeout handler finds no context loaded or queued for a stamp that is still outstanding, the stamp is completed so its waiters stop timing out every few seconds.
 
 ### Other settings
 

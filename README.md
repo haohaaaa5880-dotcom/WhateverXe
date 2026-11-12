@@ -114,7 +114,7 @@ System sleep/wake support is **experimental**. Tested configurations are MiniBoo
 ### Known issues and limits
 
 - DisplayPort reconnection can cause black screens or freezes. Tiger Lake USB-C reconnection is also unreliable; Alder Lake-S DP output/reconnection can be slow.
-- Some image-conversion operations can crash applications; App Store video can freeze the GPU on Sequoia.
+- Some image-conversion operations can crash applications.
 - Tiger Lake hardware video encode is disabled by default: on some configurations it hangs the GPU in a way that cannot be recovered and freezes the desktop. Hardware encode requests fail (for example, an export reports that it cannot encode) instead of falling back to software, because macOS still selects the hardware encoder on SMBIOS models that list it. Use an application's software encoder (such as x264) where available. Hardware decode is unaffected. Add `-wex-tgl-hwenc` to re-enable it.
 - Safari video may occasionally drop frames. FairPlay-protected playback is unsupported.
 - Up to three displays are supported. Resolutions beyond the tested configurations remain unverified.

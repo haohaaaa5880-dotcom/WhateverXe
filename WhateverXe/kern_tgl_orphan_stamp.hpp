@@ -23,7 +23,9 @@
 // when the device terminates (IOAccelEventMachineFast2::deviceTerminatedUnlocked:
 // *stampAddress[i] = submitted[i]; sfence; signalAllStamps), for that one
 // index only, and only when the donor itself classified it as reason 4
-// during a restart of exactly that index.
+// during a restart of exactly that index, or, when the donor says the engine
+// is alive (reasons 3/5), only if the index has not advanced at all since it
+// was outstanding at the start of the last reset (see retire()).
 namespace TGLOrphanStamp {
 
 // Donor (AppleIntelTGLGraphics 16.0.0) entry points.
@@ -86,30 +88,75 @@ inline bool restartingIndex(const void *machine,int index) {
 		field<int32_t>(machine,restartIndex)==index;
 }
 
-enum class Outcome : uint32_t { NotRestart, Channel, OtherReason, Layout, Range, NotBusy, Retired };
+enum class Outcome : uint32_t { NotRestart, Channel, OtherReason, Layout, Range, NotBusy, Retired, NotLost };
 
 struct Result { Outcome outcome; uint32_t submitted, returned; };
 
+// IGTimeoutReason values from the donor's eventTimeout: 3 = the engine made
+// progress (IGScheduler5::checkForProgress), 4 = no active or pending context,
+// 5 = another context is active and has run for less than 5 s, 6 = hang
+// (channel returned). 3 and 5 say the engine is alive but say nothing about
+// this index, so they only retire work that was outstanding when the last
+// reset began and has not advanced at all since: work merely waiting its turn
+// moves within the family's progress threshold, lost work never does.
+constexpr uint32_t reasonProgress=3, reasonOtherActive=5;
+constexpr unsigned snapshotCapacity=64;
+struct Snapshot {
+	bool valid {};
+	uint32_t generation {};
+	uint32_t submitted[snapshotCapacity] {}, returned[snapshotCapacity] {};
+};
+
+inline uint32_t submittedOf(const void *machine,int index) {
+	return field<uint32_t>(machine,progressBase+static_cast<size_t>(index)*progressStride+submittedField);
+}
+
+// Called when restart_channel got a channel (a real reset follows): record
+// every index's submitted/returned pair as the reset baseline.
+inline bool takeSnapshot(const void *machine,bool layout,Snapshot &snap) {
+	if (!layout) return false;
+	const int32_t count=field<int32_t>(machine,numStamps);
+	auto stamps=field<uint32_t volatile **>(machine,stampAddresses);
+	if (count<=0 || count>256 || !stamps) return false;
+	for (unsigned i=0;i<snapshotCapacity;++i) {
+		const bool present=static_cast<int32_t>(i)<count && stamps[i];
+		snap.returned[i]=present?*stamps[i]:0;
+		snap.submitted[i]=present?submittedOf(machine,static_cast<int>(i)):0;
+	}
+	snap.valid=true;++snap.generation;
+	return true;
+}
+
 // Decide and, for Retired, write the submitted value into the stamp. The
 // caller then wakes the waiters through the machine's own signalStamp.
-inline Result retire(void *machine,int index,const void *channel,uint32_t reason,bool layout) {
+inline Result retire(void *machine,int index,const void *channel,uint32_t reason,bool layout,const Snapshot *snap=nullptr) {
 	if (!restartingIndex(machine,index)) return {Outcome::NotRestart,0,0};
 	if (channel) return {Outcome::Channel,0,0};
-	if (reason!=reasonNoContext) return {Outcome::OtherReason,0,0};
+	const bool alive=reason==reasonProgress || reason==reasonOtherActive;
+	if (reason!=reasonNoContext && !alive) return {Outcome::OtherReason,0,0};
 	if (!layout) return {Outcome::Layout,0,0};
 	const int32_t count=field<int32_t>(machine,numStamps);
 	auto stamps=field<uint32_t volatile **>(machine,stampAddresses);
 	if (index<0 || index>=count || count>256 || !stamps || !stamps[index]) return {Outcome::Range,0,0};
-	const uint32_t submitted=field<uint32_t>(machine,progressBase+static_cast<size_t>(index)*progressStride+submittedField);
+	const uint32_t submitted=submittedOf(machine,index);
 	const uint32_t returned=*stamps[index];
 	if (static_cast<int32_t>(submitted-returned)<=0) return {Outcome::NotBusy,submitted,returned};
+	if (alive) {
+		const auto i=static_cast<unsigned>(index);
+		if (!snap || !snap->valid || i>=snapshotCapacity || snap->submitted[i]==snap->returned[i] ||
+			returned!=snap->returned[i]) return {Outcome::NotLost,submitted,returned};
+	}
 	*stamps[index]=submitted;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	return {Outcome::Retired,submitted,returned};
 }
 
-// Registry record TGLOrphanStampLive (uint32_t): schema, then one counter per
-// Outcome, then the last retired index and how many stamps it skipped.
-constexpr unsigned outcomes=7, recordWords=1+outcomes+2;
+// Registry record TGLOrphanStampLive (uint32_t), schema 2:
+//   [0] schema, [1..8] one counter per Outcome, [9] last retired index,
+//   [10] its gap, [11..18] reason histogram (0..6, 7 = other),
+//   [19] snapshot generation, [20] history next, then history entries of
+//   4 words {index | reason<<8 | outcome<<16, returned, submitted, baseline}.
+constexpr unsigned outcomes=8, reasons=8, historyCapacity=16;
+constexpr unsigned historyBase=21, recordWords=historyBase+4*historyCapacity;
 
 }  // namespace TGLOrphanStamp

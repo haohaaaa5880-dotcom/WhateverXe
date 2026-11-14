@@ -11575,7 +11575,7 @@ uintptr_t tglOrphanTimeoutOriginal {}, tglOrphanReasonOriginal {};
 uintptr_t tglOrphanCaptureThread {};
 uint32_t tglOrphanReason {};
 int tglOrphanLayout {};  // 0 unchecked, 1 known, -1 unknown
-uint32_t tglOrphanRecord[TGLOrphanStamp::recordWords] {1};
+uint32_t tglOrphanRecord[TGLOrphanStamp::recordWords] {2};
 void tglOrphanReasonCapture(void *accelerator,uint32_t reason) {
  if (__atomic_load_n(&tglOrphanCaptureThread,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(current_thread()))
   tglOrphanReason=reason;
@@ -11589,6 +11589,18 @@ bool tglOrphanLayoutKnown(void *machine) {
  }
  return tglOrphanLayout>0;
 }
+TGLOrphanStamp::Snapshot tglOrphanSnapshot {};
+void tglOrphanNote(int index,uint32_t reason,TGLOrphanStamp::Outcome outcome,uint32_t returned,uint32_t submitted) {
+ auto &r=tglOrphanRecord;
+ __atomic_fetch_add(&r[11+(reason<7?reason:7)],1,__ATOMIC_RELAXED);
+ const uint32_t slot=__atomic_fetch_add(&r[20],1,__ATOMIC_RELAXED)%TGLOrphanStamp::historyCapacity;
+ const auto i=static_cast<unsigned>(index);
+ uint32_t *h=&r[TGLOrphanStamp::historyBase+4*slot];
+ __atomic_store_n(&h[0],(i&0xFF)|((reason&0xFF)<<8)|(static_cast<uint32_t>(outcome)<<16),__ATOMIC_RELAXED);
+ __atomic_store_n(&h[1],returned,__ATOMIC_RELAXED);
+ __atomic_store_n(&h[2],submitted,__ATOMIC_RELAXED);
+ __atomic_store_n(&h[3],i<TGLOrphanStamp::snapshotCapacity?tglOrphanSnapshot.returned[i]:0,__ATOMIC_RELAXED);
+}
 void *tglOrphanEventTimeout(void *machine,int index) {
  if (!TGLOrphanStamp::restartingIndex(machine,index))
   return FunctionCast(tglOrphanEventTimeout,tglOrphanTimeoutOriginal)(machine,index);
@@ -11597,15 +11609,20 @@ void *tglOrphanEventTimeout(void *machine,int index) {
  __atomic_store_n(&tglOrphanCaptureThread,self,__ATOMIC_RELAXED);
  void *channel=FunctionCast(tglOrphanEventTimeout,tglOrphanTimeoutOriginal)(machine,index);
  __atomic_store_n(&tglOrphanCaptureThread,0,__ATOMIC_RELAXED);
- const bool layout=!channel && tglOrphanReason==TGLOrphanStamp::reasonNoContext && tglOrphanLayoutKnown(machine);
- const auto r=TGLOrphanStamp::retire(machine,index,channel,tglOrphanReason,layout);
+ const uint32_t reason=tglOrphanReason;
+ const bool layout=tglOrphanLayoutKnown(machine);
+ // A channel means restart_channel resets now: record the baseline first.
+ if (channel && TGLOrphanStamp::takeSnapshot(machine,layout,tglOrphanSnapshot))
+  __atomic_store_n(&tglOrphanRecord[19],tglOrphanSnapshot.generation,__ATOMIC_RELAXED);
+ const auto r=TGLOrphanStamp::retire(machine,index,channel,reason,layout,&tglOrphanSnapshot);
  __atomic_fetch_add(&tglOrphanRecord[1+static_cast<uint32_t>(r.outcome)],1,__ATOMIC_RELAXED);
+ tglOrphanNote(index,reason,r.outcome,r.returned,r.submitted);
  if (r.outcome==TGLOrphanStamp::Outcome::Retired) {
   __atomic_store_n(&tglOrphanRecord[1+TGLOrphanStamp::outcomes],static_cast<uint32_t>(index),__ATOMIC_RELAXED);
   __atomic_store_n(&tglOrphanRecord[2+TGLOrphanStamp::outcomes],r.submitted-r.returned,__ATOMIC_RELAXED);
   auto vt=*reinterpret_cast<void *const *const *>(machine);
   reinterpret_cast<void (*)(void *,int,uint32_t)>(vt[TGLOrphanStamp::slotSignalStamp])(machine,index,0);
-  SYSLOG("igfx","TGL retired orphaned stamp index %d (%u -> %u)",index,r.returned,r.submitted);
+  SYSLOG("igfx","TGL retired orphaned stamp index %d reason %u (%u -> %u)",index,reason,r.returned,r.submitted);
  }
  return channel;
 }

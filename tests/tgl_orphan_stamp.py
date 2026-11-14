@@ -25,7 +25,8 @@ wrap = xe[xe.index('void *tglOrphanEventTimeout('):xe.index('bool tglOrphanSeria
 assert wrap.index('if (!TGLOrphanStamp::restartingIndex(machine,index))') < wrap.index('tglOrphanCaptureThread,self')
 assert wrap.index('tglOrphanCaptureThread,self') < wrap.index('void *channel=FunctionCast')
 assert wrap.index('void *channel=FunctionCast') < wrap.index('tglOrphanCaptureThread,0')
-assert wrap.index('TGLOrphanStamp::retire(') < wrap.index('slotSignalStamp]')
+assert wrap.index('TGLOrphanStamp::takeSnapshot(') < wrap.index('TGLOrphanStamp::retire(') < wrap.index('slotSignalStamp]')
+assert 'if (channel && TGLOrphanStamp::takeSnapshot(' in wrap and '&tglOrphanSnapshot);' in wrap
 assert wrap.index('if (r.outcome==TGLOrphanStamp::Outcome::Retired)') < wrap.index('slotSignalStamp]')
 assert wrap.rstrip().endswith('return channel;\n}') or 'return channel;' in wrap[-40:]
 cap = xe[xe.index('void tglOrphanReasonCapture('):xe.index('bool tglOrphanLayoutKnown(')]
@@ -38,7 +39,7 @@ assert install.index('encodeDebugInfoPrologue') < install.index('routeMultiple')
 assert install.index('RouteRequest capture(reasonSymbol') < install.index('RouteRequest route(timeoutSymbol')
 assert 'tglInstallOrphanStamp(patcher,index,address,size);' in xe[xe.index('bool XE::processTGLAccelerator('):][:8000]
 retire = hdr[hdr.index('inline Result retire('):]
-order = ['restartingIndex(machine,index)', 'if (channel)', 'reason!=reasonNoContext', 'if (!layout)', 'index>=count', 'static_cast<int32_t>(submitted-returned)<=0', '*stamps[index]=submitted']
+order = ['restartingIndex(machine,index)', 'if (channel)', 'reason!=reasonNoContext && !alive', 'if (!layout)', 'index>=count', 'static_cast<int32_t>(submitted-returned)<=0', 'returned!=snap->returned[i]', '*stamps[index]=submitted']
 assert [retire.index(x) for x in order] == sorted(retire.index(x) for x in order)
 
 def arr(name):
@@ -54,6 +55,11 @@ if len(sys.argv) > 1:
     assert e == 0x2E460 and image[e:e + 26] == arr('encodeDebugInfoPrologue')
     # reason-4 path: movl $4,%esi ; jmp to encodeDebugInfo call ; then xorl r15d,r15d ; movq r15,rax
     assert image[0x1609C:0x160A1] == bytes.fromhex('be04000000')
+    # reason 3: scheduler vtable 0x150 (checkForProgress) true; reason 5: other context under 5 s
+    assert image[0x15F9E:0x15FA3] == bytes.fromhex('be03000000') and image[0x15F8C:0x15F92] == bytes.fromhex('ff9050010000')
+    assert image[0x160FD:0x16106] == bytes.fromhex('498b7e10be05000000')
+    vts = sym['__ZTV12IGScheduler5'] + 0x10
+    assert struct.unpack('<Q', image[vts + 0x150:vts + 0x158])[0] == sym['__ZN12IGScheduler516checkForProgressE10IGHwCsType']
     assert image[0x16106] == 0xE8 and t + 0 < 0x16106 and (0x1610B + struct.unpack('<i', image[0x16107:0x1610B])[0]) == e
     assert image[0x1610B:0x16111] == bytes.fromhex('4531ff4c89f8')
     # donor vtable: slots 0x210/0x228/0x250 bound to the family, 0x220 donor eventTimeout

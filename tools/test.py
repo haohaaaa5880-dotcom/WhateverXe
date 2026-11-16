@@ -41,6 +41,7 @@ display13_shutdown display13_wake_notifications released_physical_admission rele
 accelerator_resources display13_power_dispatch test_runner_contract
 resume_irq_rearm resume_ggtt_mode
 display13_edp_keep_route
+tgl_encode_guard tgl_context_owners tgl_gt_freq tgl_posh_off tgl_orphan_stamp
 """.split()
 FAMILIES = {'BigSur':'bigsur', 'Monterey':'monterey', 'Ventura':'ventura',
             'Sonoma':'sonoma', 'Sequoia':'sequoia', 'Tahoe':'tahoe'}
@@ -56,7 +57,8 @@ adls_donor adls_clock_native""".split()
 ACCELERATOR_TESTS = """tgl_ccs tgl_completion_cache tgl_cps_color_pipe tgl_ff_dop
 tgl_ff_mode tgl_object_preemption tgl_object_selector tgl_render_flush
 dsi_backing_adapter dsi_backing_native tgl_rpcs_native small_gt_urb
-tgl_tlb_preparser tgl_semaphore_tlb tgl_iosurface_compression tgl_gt2_urb""".split()
+tgl_tlb_preparser tgl_semaphore_tlb tgl_iosurface_compression tgl_gt2_urb
+tgl_encode_guard tgl_context_owners tgl_gt_freq tgl_posh_off tgl_orphan_stamp""".split()
 
 @dataclass
 class Job:

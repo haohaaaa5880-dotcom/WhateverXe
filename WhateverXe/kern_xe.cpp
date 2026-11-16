@@ -91,6 +91,11 @@
 #include "kern_tgl_submit_history.hpp"
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
+#include "kern_tgl_encode_guard.hpp"
+#include "kern_tgl_reset_trace.hpp"
+#include "kern_tgl_context_owners.hpp"
+#include "kern_tgl_orphan_stamp.hpp"
+#include <sys/proc.h>
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -305,6 +310,7 @@ void XE::tglRecordStartOrder(unsigned stage,void *object,unsigned ddi,
 
 
 // Exact donor parameter, initialized by its C++ constructor before start().
+static bool tglEncodeGuardReady;
 static uint64_t *tglBlitScratchSize;
 static uint64_t tglPPGTTClass;
 static uintptr_t tglExtendedBufferReturn;
@@ -321,27 +327,120 @@ uint32_t tglRecoveryCalls {}, tglRecoveryReturns {};
 TGLRecovery::Probe tglRecoveryProbe {{},
 	[](void *mmio,uint32_t offset)->uint32_t {return *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mmio)+offset);},
 	[](unsigned us) {IODelay(us);}};
-uint64_t tglRecoveryRecords[16][16] {};
-bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
-	uint64_t data[2+16*16] {};
-	data[0]=__atomic_load_n(&tglRecoveryCalls,__ATOMIC_ACQUIRE);
-	data[1]=__atomic_load_n(&tglRecoveryReturns,__ATOMIC_ACQUIRE);
-	for (unsigned i=0;i<16;++i) {
-		if (__atomic_load_n(&tglRecoveryRecords[i][15],__ATOMIC_ACQUIRE))
-			memcpy(data+2+i*16,tglRecoveryRecords[i],sizeof(tglRecoveryRecords[i]));
+// Record schema 125: 32 qwords, ready flag in q[31].
+constexpr unsigned tglRecoveryWords=32;
+uint64_t tglRecoveryRecords[16][tglRecoveryWords] {};
+TGLResetTrace::Ring tglResetTrace;
+bool tglDisplaySyncSerialize(void *,void *,OSSerialize *serializer);
+inline uint64_t tglTraceNow() { uint64_t t {};clock_get_uptime(&t);return t; }
+bool tglResetTraceSerialize(void *,void *,OSSerialize *serializer) {
+	// Header: schema, next sequence, capacity, words. Built in the OSData.
+	const uint64_t head[4] {1,__atomic_load_n(&tglResetTrace.next,__ATOMIC_ACQUIRE),
+		TGLResetTrace::capacity,TGLResetTrace::words};
+	auto out=OSData::withCapacity(sizeof(head)+sizeof(tglResetTrace.record));if (!out) return false;
+	bool ok=out->appendBytes(head,sizeof(head)) && out->appendBytes(tglResetTrace.record,sizeof(tglResetTrace.record));
+	ok=ok && out->serialize(serializer);out->release();return ok;
+}
+// Hang forensics (schema 1), captured read-only before the native reset touches
+// the engine: live RCS registers, the stuck context's LRC state page, and the
+// 32 ring dwords before the hardware head. No writes, no donor calls.
+// q0 uptime, q1 channel|type<<32|flags<<40, q2..10 register pairs, q11..50 LRC
+// state dwords 0x1000..0x113F, q51..66 ring, q67 ok|seq<<8|mask<<32, q68 ready.
+constexpr unsigned tglHangWords=74, tglHangRecords=8;
+// q69..72: pre|post<<32 of RPNSWREQ A008, RPSTAT1 1381B4 (CAGF 19:11), RP_CONTROL
+// A024, RC_STATE A094; q73 ready. Units: 16.67 MHz (Gen9+ frequency ratio).
+constexpr uint32_t tglHangFreqRegs[4] {0xA008,0x1381B4,0xA024,0xA094};
+uint64_t *tglHangLastRecord {};
+constexpr uint32_t tglHangRegs[18] {0x2030,0x2034,0x2038,0x203C,0x2064,0x2068,0x206C,0x2074,
+	0x2110,0x2140,0x2168,0x2244,0x209C,0x2234,0x2238,0x23A0,0x2050,0x44050};
+uint64_t tglHangRecord[tglHangRecords][tglHangWords] {};
+uint32_t tglHangCount {};
+void tglHangCapture(void *channel) {
+	const auto n=__atomic_fetch_add(&tglHangCount,1,__ATOMIC_RELAXED);
+	auto q=tglHangRecord[n%tglHangRecords];bzero(q,sizeof(tglHangRecord[0]));
+	clock_get_uptime(&q[0]);uint64_t ok {};
+	void *accel=TGLRecovery::field<void *>(channel,0x18);
+	auto bar=accel ? TGLRecovery::field<volatile uint8_t *>(accel,0x1240) : nullptr;
+	uint32_t head {};
+	if (bar) {
+		auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(bar+r);};
+		for (unsigned i=0;i<18;i+=2) q[2+i/2]=rd(tglHangRegs[i])|static_cast<uint64_t>(rd(tglHangRegs[i+1]))<<32;
+		head=static_cast<uint32_t>(q[2]>>32);ok|=1;
+		for (unsigned i=0;i<4;++i) q[69+i]=rd(tglHangFreqRegs[i]);
 	}
-	auto out=OSData::withBytes(data,sizeof(data));if (!out) return false;
-	const bool ok=out->serialize(serializer);out->release();return ok;
+	void *ring=TGLRecovery::field<void *>(channel,0x130);
+	void *ctx=ring ? TGLRecovery::field<void *>(ring,0x20) : nullptr;
+	void *ch=ctx ? TGLRecovery::field<void *>(ctx,0xB8) : nullptr;
+	q[1]=(ch ? TGLRecovery::field<uint32_t>(ch,0x20) : 0xFFFFFFFFu)|
+		static_cast<uint64_t>(ctx ? TGLRecovery::field<uint8_t>(ctx,0x6C) : 0xFF)<<32|
+		static_cast<uint64_t>(ctx ? TGLRecovery::field<uint8_t>(ctx,0x6E) : 0xFF)<<40;
+	void *imageBuffer=ctx ? TGLRecovery::field<void *>(ctx,0x98) : nullptr;
+	auto image=imageBuffer ? TGLRecovery::field<const uint8_t *>(imageBuffer,0x38) : nullptr;
+	if (image) { memcpy(&q[11],image+0x1000,40*8);ok|=2; }
+	void *ringBuffer=ring ? TGLRecovery::field<void *>(ring,0x80) : nullptr;
+	auto ringVA=ringBuffer ? TGLRecovery::field<const uint8_t *>(ringBuffer,0x38) : nullptr;
+	const uint32_t mask=ring ? TGLRecovery::field<uint32_t>(ring,0x90) : 0;
+	if (ringVA && mask>=0xFFF && ((mask+1)&mask)==0) {
+		auto d=reinterpret_cast<uint32_t *>(&q[51]);
+		const uint32_t end=head&0x1FFFFC;
+		for (unsigned i=0;i<32;++i)
+			d[i]=*reinterpret_cast<const uint32_t *>(ringVA+((end-128+i*4)&mask&~3u));
+		ok|=4;
+	}
+	q[67]=ok|static_cast<uint64_t>(n+1)<<8|static_cast<uint64_t>(mask)<<32;
+	tglHangLastRecord=q;
+}
+// After the native reset and replay: post-reset frequency samples, then publish.
+void tglHangFinish(void *channel) {
+	auto q=tglHangLastRecord;if (!q) return;tglHangLastRecord=nullptr;
+	void *accel=TGLRecovery::field<void *>(channel,0x18);
+	auto bar=accel ? TGLRecovery::field<volatile uint8_t *>(accel,0x1240) : nullptr;
+	if (bar) for (unsigned i=0;i<4;++i)
+		q[69+i]|=static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(bar+tglHangFreqRegs[i]))<<32;
+	__atomic_store_n(&q[73],1,__ATOMIC_RELEASE);
+}
+bool tglHangSerialize(void *,void *,OSSerialize *serializer) {
+	const uint64_t head[4] {1,__atomic_load_n(&tglHangCount,__ATOMIC_ACQUIRE),tglHangRecords,tglHangWords};
+	auto out=OSData::withCapacity(sizeof(head)+sizeof(tglHangRecord));if (!out) return false;
+	bool ok=out->appendBytes(head,sizeof(head)) && out->appendBytes(tglHangRecord,sizeof(tglHangRecord));
+	ok=ok && out->serialize(serializer);out->release();return ok;
+}
+bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
+	// Built in the OSData, not on the kernel stack (boot-stack budget).
+	const uint64_t head[2] {__atomic_load_n(&tglRecoveryCalls,__ATOMIC_ACQUIRE),
+		__atomic_load_n(&tglRecoveryReturns,__ATOMIC_ACQUIRE)};
+	auto out=OSData::withCapacity(sizeof(head)+sizeof(tglRecoveryRecords));if (!out) return false;
+	bool ok=out->appendBytes(head,sizeof(head));
+	static const uint64_t empty[tglRecoveryWords] {};
+	for (unsigned i=0;ok && i<16;++i) {
+		const bool ready=__atomic_load_n(&tglRecoveryRecords[i][tglRecoveryWords-1],__ATOMIC_ACQUIRE);
+		ok=out->appendBytes(ready ? tglRecoveryRecords[i] : empty,sizeof(tglRecoveryRecords[i]));
+	}
+	ok=ok && out->serialize(serializer);out->release();return ok;
 }
 }
 
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
+	tglHangCapture(channel);
+	{
+		// Trace the streamer of the ring being recovered (aux = channel index).
+		void *ring=TGLRecovery::field<void *>(channel,0x130);
+		void *sched=TGLRecovery::field<void *>(TGLRecovery::field<void *>(channel,0x18),0x1250);
+		const uint8_t type=TGLRecovery::field<uint8_t>(ring,0x40);
+		void *ctx=TGLRecovery::field<void *>(ring,0x20);
+		void *ch=ctx ? TGLRecovery::field<void *>(ctx,0xB8) : nullptr;
+		if (sched && type<=1) TGLResetTrace::record(tglResetTrace,before,TGLResetTrace::Recovery,
+			TGLRecovery::field<void *>(sched,0xCA0+type*8u),ch ? TGLRecovery::field<uint32_t>(ch,0x20) : UINT32_MAX,n+1);
+	}
+	// Render-domain register restore, sibling re-init and lost-work completion
+	// run in the reset path itself (wrapTGLCSBReset), whichever caller reached it.
 	const auto result=TGLRecovery::resetAndResume(channel,&tglRecoveryProbe);
+	tglHangFinish(channel);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
-		auto q=tglRecoveryRecords[n];q[0]=123;q[1]=n+1;q[2]=before;q[3]=after;
+		auto q=tglRecoveryRecords[n];q[0]=126;q[1]=n+1;q[2]=before;q[3]=after;
 		q[4]=reinterpret_cast<uintptr_t>(channel);q[5]=result.ring;
 		q[6]=result.context;q[7]=result.affected;q[8]=result.index;
 		q[9]=result.failuresBefore;q[10]=result.failuresAfter;q[11]=result.resetOK;
@@ -349,10 +448,10 @@ void XE::wrapTGLRecovery(void *channel) {
 		const auto &r=result.release;
 		q[12]=r.busy|(r.semaphore<<8)|(r.stalled<<16)|(uint64_t(r.resets)<<24)|(uint64_t(r.resetOK)<<32);
 		q[13]=r.ipehr|(uint64_t(r.ipehrAfter)<<32);
-		// Guilty-stamp completion: forced | stamp before<<8 (low 24 bits) | target<<32.
+		// Attributed-channel stamp completion: forced | stamp before<<8 (low 24 bits) | target<<32.
 		const auto &c=result.completion;
 		q[14]=uint64_t(c.forced)|(uint64_t(c.before&0xFFFFFF)<<8)|(uint64_t(c.target)<<32);
-		__atomic_store_n(&q[15],1,__ATOMIC_RELEASE);
+		__atomic_store_n(&q[tglRecoveryWords-1],1,__ATOMIC_RELEASE);
 	}
 	__atomic_fetch_add(&tglRecoveryReturns,1,__ATOMIC_RELEASE);
 }
@@ -515,9 +614,56 @@ static bool tglCPSRestorePointer(void *context,uintptr_t caller) {
  __atomic_fetch_add(&tglCPSCounts[15],1,__ATOMIC_RELAXED);
  return true;
 }
+// POSH fields of a restored RCS image. initWithOptions fixes a safe-image clone
+// after restoreFromSafeImage (7C15E..7C25C): a non-POSH context gets CTX_CTRL
+// bit 4 cleared (masked write), a POSH context gets POSH_LRCA = its own POCS
+// buffer. beginReset (7C919) calls restoreFromSafeImage alone, so after a
+// reset every RCS context carries the golden context's CTX_CTRL bit 4 and
+// POSH_LRCA (forensics: WindowServer POSH_LRCA 402c3000 -> golden 402b4000).
+// Put back the creation-time state on the reset path; non-POSH contexts also
+// drop the inherited POSH_LRCA on both paths (NootedGreen-NP550XDA xe/noposh).
+// Counts: reset POSH relinked, reset non-POSH fixed, new non-POSH cleared,
+// declined (layout mismatch). Opt-out: -wex-tgl-no-poshfix.
+bool tglPOSHRepairEnabled {};
+uint32_t tglPOSHRepairCounts[4] {};
+static volatile uint32_t *tglPOSHImage(void *context) {
+ auto c=static_cast<uint8_t *>(context);
+ if(!c || c[0x6C]!=0 || !tglCPSCPUAddress)return nullptr;
+ auto buffer=*reinterpret_cast<uint8_t **>(c+0x98);
+ if(!buffer || *reinterpret_cast<uint64_t *>(buffer+0x20)<0x2000)return nullptr;
+ auto img=static_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(tglCPSCPUAddress)(buffer));
+ if(!img || img[0x1008/4]!=0x2244 || img[0x10D4/4]!=0x21B0)return nullptr;
+ return img;
+}
+static void tglPOSHRepair(void *context,bool reset,uint32_t saved) {
+ auto img=tglPOSHImage(context);
+ if(!img) { __atomic_fetch_add(&tglPOSHRepairCounts[3],1,__ATOMIC_RELAXED);return; }
+ auto &control=img[0x100C/4],&lrca=img[0x10D8/4];
+ if(static_cast<uint8_t *>(context)[0x6E]&0x10) {
+  if(!reset || !saved)return;
+  lrca=saved;__atomic_fetch_add(&tglPOSHRepairCounts[0],1,__ATOMIC_RELAXED);
+ } else {
+  if(reset)control=(control&0xFFEFFFEFu)|0x00100000u;
+  lrca=0;__atomic_fetch_add(&tglPOSHRepairCounts[reset ? 1 : 2],1,__ATOMIC_RELAXED);
+ }
+ asm volatile("clflush (%0)"::"r"(&control):"memory");
+ asm volatile("clflush (%0)"::"r"(&lrca):"memory");
+ asm volatile("mfence":::"memory");
+}
+bool tglPOSHRepairSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[5] {1};
+ for(unsigned i=0;i<4;++i)out[i+1]=__atomic_load_n(&tglPOSHRepairCounts[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 bool tglCPSRestore(void *context) {
  const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+ const bool reset=caller!=tglCPSRestoreCaller;
+ uint32_t saved {};
+ if(tglPOSHRepairEnabled && reset)
+  if(auto img=tglPOSHImage(context))saved=img[0x10D8/4];
  const bool result=FunctionCast(tglCPSRestore,tglCPSRestoreOriginal)(context);
+ if(result && tglPOSHRepairEnabled)tglPOSHRepair(context,reset,saved);
  if(result && caller==tglCPSRestoreCaller)adlnCaptureOwnedGolden(context);
  return result && tglCPSRestorePointer(context,caller) &&
   (caller!=tglCPSRestoreCaller || tglAlderLakeNGoldenRestore(context));
@@ -13839,6 +13985,283 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+// Metal command-queue graphics contexts are created from one file-static copy
+// of g_cInitGfxHwCtxParamsForGraphics (0xB0BC0, loaded only by
+// IGAccelCommandQueue::createHardwareContextIfNeeded). Its flags byte 0x1C
+// includes 0x10: pair the RCS context with a POCS (position-only shading)
+// context. The donor tells user space POSH is off
+// (_kIntelSharedExFtrPoshEnable = 0), GL/compute/video contexts use 0x0C, and
+// Linux never enables POSH on Gen12 LP. Every RCS hang captured on this
+// machine is such a paired WindowServer context, stalled with its ring fully
+// consumed and both RCS and POCS not done.
+// The other copy (0xB09A4) builds the start-time init/golden context.
+// startGraphicsEngine copies that context's POCS image unconditionally, so it
+// must keep POSH (clearing it panics at boot). Non-POSH contexts restored from a
+// POSH golden image are the native GL path (initWithOptions clears CTX_CTRL
+// bit 4 and skips the POCS image). Opt-out: -wex-tgl-posh.
+static void tglInstallPOSHOff(KernelPatcher &patcher,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-posh")) { root->setProperty("TGLPOSHOff",false);return; }
+ static const uint8_t before[12] {0,0,0x1C,0,0,0,0,0,0,0,0,0}, after[12] {0,0,0x0C,0,0,0,0,0,0,0,0,0};
+ constexpr uint32_t queueCopy=0xB0BC0, initCopy=0xB09A4, queueLoad=0x2FD76, initLoads[2] {0x25D95,0x25DB9};
+ auto target=[&](uint32_t site)->mach_vm_address_t {
+  auto lea=reinterpret_cast<const uint8_t *>(address+site);
+  if (lea[0]!=0x48 || lea[1]!=0x8D || lea[2]!=0x35) return 0;
+  int32_t disp {};memcpy(&disp,lea+3,sizeof(disp));
+  return address+site+7+static_cast<int64_t>(disp);
+ };
+ bool ready=size>0xB0BD0 && !memcmp(reinterpret_cast<void *>(address+queueCopy),before,sizeof(before)) &&
+  !memcmp(reinterpret_cast<void *>(address+initCopy),before,sizeof(before)) &&
+  target(queueLoad)==address+queueCopy && target(initLoads[0])==address+initCopy && target(initLoads[1])==address+initCopy;
+ if (ready) {
+  auto site=reinterpret_cast<uint8_t *>(address+queueCopy);
+  KernelPatcher::LookupPatch patch {&kextIntelTGL,before,after,sizeof(before),1};
+  patcher.applyLookupPatch(&patch,site,sizeof(before)+1);
+  ready=!memcmp(site,after,sizeof(after)) && !memcmp(reinterpret_cast<void *>(address+initCopy),before,sizeof(before));
+  patcher.clearError();
+ }
+ root->setProperty("TGLPOSHOff",ready);
+ if (!ready) SYSLOG("igfx","TGL POSH-off patch not applied (donor bytes differ); graphics contexts keep POSH");
+}
+
+// GT frequency floor. Without GuC/SLPC (-disablegfxfirmware) the donor's
+// power query fails and IGHardwareCommandStreamer5::setGTFrequencyMMIO writes
+// RPNSWREQ (A008) = 0 on every submission (submitExecList 3A70A..3A74D and the
+// change-frequency timer). The GT then only runs fast because the hardware
+// raises the clock by itself; after a GDRST it stays at RPn (~100 MHz), every
+// WindowServer frame misses the progress timeout and the resets chain.
+// Same finding and fix on real TGL: joaovitoraramo/NootedGreen-NP550XDA
+// (XE-GTFREQ, JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe#29).
+// A request of 0 becomes 1500 MHz (the hardware clamps to RP0); non-zero
+// requests pass unchanged. Opt-out: -wex-tgl-no-gtfreq.
+namespace {
+uintptr_t tglGTFreqOriginal {};
+uint32_t tglGTFreqFloor {};       // RPNSWREQ value, 0 = off
+uint32_t tglGTFreqCounts[4] {};   // calls, zero requests raised, last in, last out
+void tglGTFreqSet(void *streamer,uint32_t value) {
+ __atomic_fetch_add(&tglGTFreqCounts[0],1,__ATOMIC_RELAXED);
+ __atomic_store_n(&tglGTFreqCounts[2],value,__ATOMIC_RELAXED);
+ if (!value && tglGTFreqFloor) { value=tglGTFreqFloor;__atomic_fetch_add(&tglGTFreqCounts[1],1,__ATOMIC_RELAXED); }
+ __atomic_store_n(&tglGTFreqCounts[3],value,__ATOMIC_RELAXED);
+ FunctionCast(tglGTFreqSet,tglGTFreqOriginal)(streamer,value);
+}
+bool tglGTFreqSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[6] {1,tglGTFreqFloor};
+ for (unsigned i=0;i<4;++i) out[2+i]=__atomic_load_n(&tglGTFreqCounts[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+}
+static void tglInstallGTFreqFloor(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-no-gtfreq")) { root->setProperty("TGLGTFreqFloorReady",false);return; }
+ const uint32_t ratio=1500*3/50;  // 1500 MHz as Gen9+ RPNSWREQ ratio (16.67 MHz units, bits 31:23)
+ const char *symbol="__ZN26IGHardwareCommandStreamer518setGTFrequencyMMIOEj";
+ // push rbp; mov rbp,rsp; push r15/r14/r12/rbx; sub rsp,0x10; mov r14d,esi; mov r15,rdi
+ static const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x10,
+  0x41,0x89,0xF6,0x49,0x89,0xFF};
+ // ... mov rcx,[rcx+0x1240]; mov [rcx+0xA008],r14d
+ static const uint8_t store[] {0x48,0x8B,0x89,0x40,0x12,0x00,0x00,0x44,0x89,0xB1,0x08,0xA0,0x00,0x00};
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
+ bool ready=size>0x3BFE0 && fn==address+0x3BF6E &&
+  !memcmp(reinterpret_cast<void *>(fn),head,sizeof(head)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x3BFBF),store,sizeof(store));
+ patcher.clearError();
+ if (ready) {
+  tglGTFreqFloor=ratio<<23;
+  KernelPatcher::RouteRequest route(symbol,tglGTFreqSet,tglGTFreqOriginal);
+  ready=patcher.routeMultiple(index,&route,1,address,size);
+  if (!ready) tglGTFreqFloor=0;
+  patcher.clearError();
+ }
+ root->setProperty("TGLGTFreqFloorReady",ready);
+ if (ready) if (auto live=OSSerializer::forTarget(nullptr,tglGTFreqSerialize)) {
+  root->setProperty("TGLGTFreqLive",live);live->release();
+ }
+}
+
+// Orphaned-stamp retirement (see kern_tgl_orphan_stamp.hpp). eventTimeout is
+// only acted on while restart_channel works on that same index; the reason
+// is taken from the donor's own encodeDebugInfo call on this thread.
+// Opt-out: -wex-tgl-no-orphanstamp.
+namespace {
+uintptr_t tglOrphanTimeoutOriginal {}, tglOrphanReasonOriginal {};
+uintptr_t tglOrphanCaptureThread {};
+uint32_t tglOrphanReason {};
+int tglOrphanLayout {};  // 0 unchecked, 1 known, -1 unknown
+uint32_t tglOrphanRecord[TGLOrphanStamp::recordWords] {2};
+void tglOrphanReasonCapture(void *accelerator,uint32_t reason) {
+ if (__atomic_load_n(&tglOrphanCaptureThread,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(current_thread()))
+  tglOrphanReason=reason;
+ FunctionCast(tglOrphanReasonCapture,tglOrphanReasonOriginal)(accelerator,reason);
+}
+bool tglOrphanLayoutKnown(void *machine) {
+ if (!tglOrphanLayout) {
+  auto vt=*reinterpret_cast<void *const *const *>(machine);
+  tglOrphanLayout=vt && TGLOrphanStamp::layoutKnown(vt[TGLOrphanStamp::slotCheckGPUProgress],
+   vt[TGLOrphanStamp::slotSignalStamp],vt[TGLOrphanStamp::slotDeviceTerminated])?1:-1;
+ }
+ return tglOrphanLayout>0;
+}
+TGLOrphanStamp::Snapshot tglOrphanSnapshot {};
+void tglOrphanNote(int index,uint32_t reason,TGLOrphanStamp::Outcome outcome,uint32_t returned,uint32_t submitted) {
+ auto &r=tglOrphanRecord;
+ __atomic_fetch_add(&r[11+(reason<7?reason:7)],1,__ATOMIC_RELAXED);
+ const uint32_t slot=__atomic_fetch_add(&r[20],1,__ATOMIC_RELAXED)%TGLOrphanStamp::historyCapacity;
+ const auto i=static_cast<unsigned>(index);
+ uint32_t *h=&r[TGLOrphanStamp::historyBase+4*slot];
+ __atomic_store_n(&h[0],(i&0xFF)|((reason&0xFF)<<8)|(static_cast<uint32_t>(outcome)<<16),__ATOMIC_RELAXED);
+ __atomic_store_n(&h[1],returned,__ATOMIC_RELAXED);
+ __atomic_store_n(&h[2],submitted,__ATOMIC_RELAXED);
+ __atomic_store_n(&h[3],i<TGLOrphanStamp::snapshotCapacity?tglOrphanSnapshot.returned[i]:0,__ATOMIC_RELAXED);
+}
+void *tglOrphanEventTimeout(void *machine,int index) {
+ if (!TGLOrphanStamp::restartingIndex(machine,index))
+  return FunctionCast(tglOrphanEventTimeout,tglOrphanTimeoutOriginal)(machine,index);
+ const auto self=reinterpret_cast<uintptr_t>(current_thread());
+ tglOrphanReason=UINT32_MAX;
+ __atomic_store_n(&tglOrphanCaptureThread,self,__ATOMIC_RELAXED);
+ void *channel=FunctionCast(tglOrphanEventTimeout,tglOrphanTimeoutOriginal)(machine,index);
+ __atomic_store_n(&tglOrphanCaptureThread,0,__ATOMIC_RELAXED);
+ const uint32_t reason=tglOrphanReason;
+ const bool layout=tglOrphanLayoutKnown(machine);
+ // A channel means restart_channel resets now: record the baseline first.
+ if (channel && TGLOrphanStamp::takeSnapshot(machine,layout,tglOrphanSnapshot))
+  __atomic_store_n(&tglOrphanRecord[19],tglOrphanSnapshot.generation,__ATOMIC_RELAXED);
+ const auto r=TGLOrphanStamp::retire(machine,index,channel,reason,layout,&tglOrphanSnapshot);
+ __atomic_fetch_add(&tglOrphanRecord[1+static_cast<uint32_t>(r.outcome)],1,__ATOMIC_RELAXED);
+ tglOrphanNote(index,reason,r.outcome,r.returned,r.submitted);
+ if (r.outcome==TGLOrphanStamp::Outcome::Retired) {
+  __atomic_store_n(&tglOrphanRecord[1+TGLOrphanStamp::outcomes],static_cast<uint32_t>(index),__ATOMIC_RELAXED);
+  __atomic_store_n(&tglOrphanRecord[2+TGLOrphanStamp::outcomes],r.submitted-r.returned,__ATOMIC_RELAXED);
+  auto vt=*reinterpret_cast<void *const *const *>(machine);
+  reinterpret_cast<void (*)(void *,int,uint32_t)>(vt[TGLOrphanStamp::slotSignalStamp])(machine,index,0);
+  SYSLOG("igfx","TGL retired orphaned stamp index %d reason %u (%u -> %u)",index,reason,r.returned,r.submitted);
+ }
+ return channel;
+}
+bool tglOrphanSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[TGLOrphanStamp::recordWords];
+ for (unsigned i=0;i<TGLOrphanStamp::recordWords;++i) out[i]=__atomic_load_n(&tglOrphanRecord[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+}
+static void tglInstallOrphanStamp(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-no-orphanstamp")) { root->setProperty("TGLOrphanStampReady",false);return; }
+ const char *timeoutSymbol="__ZN19IGAccelEventMachine12eventTimeoutEi";
+ const char *reasonSymbol="__ZN16IntelAccelerator15encodeDebugInfoE15IGTimeoutReason";
+ const auto timeout=patcher.solveSymbol<mach_vm_address_t>(index,timeoutSymbol,address,size);
+ patcher.clearError();
+ const auto reason=patcher.solveSymbol<mach_vm_address_t>(index,reasonSymbol,address,size);
+ patcher.clearError();
+ bool ready=size>TGLOrphanStamp::encodeDebugInfoEntry+sizeof(TGLOrphanStamp::encodeDebugInfoPrologue) &&
+  timeout==address+TGLOrphanStamp::eventTimeoutEntry && reason==address+TGLOrphanStamp::encodeDebugInfoEntry &&
+  !memcmp(reinterpret_cast<void *>(timeout),TGLOrphanStamp::eventTimeoutPrologue,sizeof(TGLOrphanStamp::eventTimeoutPrologue)) &&
+  !memcmp(reinterpret_cast<void *>(reason),TGLOrphanStamp::encodeDebugInfoPrologue,sizeof(TGLOrphanStamp::encodeDebugInfoPrologue));
+ if (ready) {
+  // Reason capture first: an eventTimeout route without it would only ever see UINT32_MAX.
+  KernelPatcher::RouteRequest capture(reasonSymbol,tglOrphanReasonCapture,tglOrphanReasonOriginal);
+  ready=patcher.routeMultiple(index,&capture,1,address,size);
+  patcher.clearError();
+  if (ready) {
+   KernelPatcher::RouteRequest route(timeoutSymbol,tglOrphanEventTimeout,tglOrphanTimeoutOriginal);
+   ready=patcher.routeMultiple(index,&route,1,address,size);
+   patcher.clearError();
+  }
+ }
+ root->setProperty("TGLOrphanStampReady",ready);
+ if (ready) if (auto live=OSSerializer::forTarget(nullptr,tglOrphanSerialize)) {
+  root->setProperty("TGLOrphanStampLive",live);live->release();
+ }
+}
+
+// Hardware encode admission (see kern_tgl_encode_guard.hpp). Counters are
+// relaxed statistics only; rejection never depends on them.
+namespace {
+uint32_t tglEncodeRejected[TGLEncodeGuard::Count] {};
+bool tglEncodeLogged {};
+bool tglEncodeGuardSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t q[1+TGLEncodeGuard::Count] {1};
+ for(uint32_t i=0;i<TGLEncodeGuard::Count;++i)q[1+i]=__atomic_load_n(&tglEncodeRejected[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+template<TGLEncodeGuard::Path P> void tglEncodeReject(void *,void *info) {
+ TGLEncodeGuard::reject(info);
+ __atomic_fetch_add(&tglEncodeRejected[P],1,__ATOMIC_RELAXED);
+ bool expected=false;
+ if(__atomic_compare_exchange_n(&tglEncodeLogged,&expected,true,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))
+  SYSLOG("igfx","TGL hardware encode stream rejected (path %u); use -wex-tgl-hwenc to allow",static_cast<unsigned>(P));
+}
+// Returns true when encode is either explicitly allowed or fully guarded.
+// A partial install is impossible: every site is qualified before any route.
+bool tglInstallEncodeGuard(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(checkKernelArgument("-wex-tgl-hwenc")) {root->setProperty("TGLHardwareEncode","allowed");return true;}
+ const auto base=reinterpret_cast<const uint8_t *>(address);
+ bool ready=true;
+ for(uint32_t i=0;i<TGLEncodeGuard::Count;++i) {
+  const auto &site=TGLEncodeGuard::sites[i];
+  const auto solved=patcher.solveSymbol<mach_vm_address_t>(index,site.symbol,address,size);
+  patcher.clearError();
+  ready=ready && TGLEncodeGuard::qualify(static_cast<TGLEncodeGuard::Path>(i),base,size,solved);
+ }
+ if(ready) {
+  using namespace TGLEncodeGuard;
+  KernelPatcher::RouteRequest routes[] {
+   {sites[EncodingCommon].symbol,tglEncodeReject<EncodingCommon>},
+   {sites[MediaKernel].symbol,tglEncodeReject<MediaKernel>},
+   {sites[VDENC].symbol,tglEncodeReject<VDENC>},
+   {sites[AVCPAK].symbol,tglEncodeReject<AVCPAK>},
+  };
+  ready=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+  patcher.clearError();
+ }
+ root->setProperty("TGLHardwareEncode",ready ? "guarded" : "guard-unavailable");
+ if(ready)if(auto live=OSSerializer::forTarget(nullptr,tglEncodeGuardSerialize)) {
+  root->setProperty("TGLEncodeGuardLive",live);live->release();
+ }
+ if(!ready)SYSLOG("igfx","TGL hardware encode guard unavailable: donor image does not match");
+ return ready;
+}
+
+// Hardware-context ownership map (kern_tgl_context_owners.hpp), diagnostic only.
+TGLContextOwners::Ring tglContextOwners;
+mach_vm_address_t tglContextInitOrg {};
+bool tglContextInit(void *context,void *task,const void *params,uint8_t flags) {
+ const bool ok=FunctionCast(tglContextInit,tglContextInitOrg)(context,task,params,flags);
+ if(ok) {
+  char name[TGLContextOwners::nameLength] {};proc_selfname(name,sizeof(name));
+  TGLContextOwners::note(tglContextOwners,context,proc_selfpid(),name);
+ }
+ return ok;
+}
+bool tglContextOwnersSerialize(void *,void *,OSSerialize *serializer) {
+ // Schema 1: next sequence, capacity, then 128 owners {seq, tag, pid, name[16]}.
+ const uint64_t head[3] {1,__atomic_load_n(&tglContextOwners.next,__ATOMIC_ACQUIRE),TGLContextOwners::capacity};
+ auto out=OSData::withCapacity(sizeof(head)+sizeof(tglContextOwners.slot));if(!out)return false;
+ bool ok=out->appendBytes(head,sizeof(head)) && out->appendBytes(tglContextOwners.slot,sizeof(tglContextOwners.slot));
+ ok=ok && out->serialize(serializer);out->release();return ok;
+}
+bool tglInstallContextOwners(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ const char *init="__ZN17IGHardwareContext15initWithOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh";
+ bool ready=size>TGLContextOwners::contextInitEntry+sizeof(TGLContextOwners::contextInitPrologue) &&
+  patcher.solveSymbol<mach_vm_address_t>(index,init,address,size)==address+TGLContextOwners::contextInitEntry &&
+  !memcmp(reinterpret_cast<const void *>(address+TGLContextOwners::contextInitEntry),TGLContextOwners::contextInitPrologue,sizeof(TGLContextOwners::contextInitPrologue));
+ patcher.clearError();
+ if(ready) {
+  KernelPatcher::RouteRequest owner(init,tglContextInit,tglContextInitOrg);
+  ready=patcher.routeMultiple(index,&owner,1,address,size);patcher.clearError();
+ }
+ if(ready)if(auto live=OSSerializer::forTarget(nullptr,tglContextOwnersSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("TGLContextOwners",live);live->release();
+ }
+ return ready;
+}
+}
+
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
  // Framebuffer-only mode must never enter the donor accelerator probe.
@@ -13857,6 +14280,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  }
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
+ tglEncodeGuardReady=tglInstallEncodeGuard(patcher,index,address,size);
+ tglInstallContextOwners(patcher,index,address,size);
+ tglInstallGTFreqFloor(patcher,index,address,size);
+ tglInstallOrphanStamp(patcher,index,address,size);
+ tglInstallPOSHOff(patcher,address,size);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
@@ -14543,6 +14971,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			patcher.clearError();
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeReady",cpsOK);
+			tglPOSHRepairEnabled=cpsOK && !checkKernelArgument("-wex-tgl-no-poshfix");
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLPOSHRepairReady",tglPOSHRepairEnabled);
+			if(tglPOSHRepairEnabled) if(auto live=OSSerializer::forTarget(nullptr,tglPOSHRepairSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLPOSHRepairLive",live);live->release();
+			}
 			// Linux Gen12 Wa_18022495364: an INDIRECT_CTX cache invalidation,
 			// distinct from ring PIPE_CONTROL. Keep the per-context batch intact.
 			bool contextCacheOK=!contextCacheRequested;
@@ -14755,6 +15188,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				}
 				if (recoveryOK) if (auto live=OSSerializer::forTarget(nullptr,tglRecoverySerialize)) {
 					IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryLive",live);live->release();
+				}
+				if (recoveryOK) if (auto trace=OSSerializer::forTarget(nullptr,tglResetTraceSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLResetTrace",trace);trace->release();
+				}
+				if (recoveryOK) if (auto hang=OSSerializer::forTarget(nullptr,tglHangSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLHangForensics",hang);hang->release();
+				}
+				if (recoveryOK) if (auto display=OSSerializer::forTarget(nullptr,tglDisplaySyncSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplaySyncLive",display);display->release();
 				}
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
@@ -17004,6 +17446,15 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
 
+	// Without -wex-tgl-hwenc, hardware encode is refused in the kernel (see
+	// tglInstallEncodeGuard). Also withdraw the HEVC encode capability and mark
+	// the H.264 encoder restricted for VideoToolbox. Decode keys (IOGVACodec,
+	// HEVC decode, scaler, BGRA) remain; the kernel guard is authoritative.
+	if (!checkKernelArgument("-wex-tgl-hwenc")) {
+		that->removeProperty("IOGVAHEVCEncodeCapabilities");
+		that->setProperty("IOGVAEncoderRestricted", true);
+	}
+
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
 		SYSLOG("igfx", "TGL blit scratch parameter mismatch");
 		return false;
@@ -17885,6 +18336,43 @@ void tglCSBRestoreHWS(void *streamer) {
  *reg=tglHWSPGA[io.engine];(void)*reg;
  ++tglHWSRestores[io.engine];
 }
+// Render-domain registers that GDRST mask 2 clears and that neither the donor's
+// restore list nor initModeRegisters/initHardwareStatusPageRegisters reinstate
+// (found on the XPS 13 9310, TGL 9A49): RING_PSMI_CTL RCS 0x2050 / CCS 0x1A050
+// (masked; IntelAccelerator::setAsyncSliceCount sets 0x10801080 = Wa_1607030317/
+// 1607186500/1607297627 only at start; without it RCS can power down inside
+// MI_WAIT_FOR_EVENT and WindowServer's scanline waits never complete), RCS EMR
+// 0x20B4, and CCS IMR 0x1A0A8, indirect-context WA pointer 0x1A058,
+// FORCE_TO_NONPRIV 0x1A4D4 and CSFE chicken 0x1A0D4 (masked) - the CCS
+// counterparts of entries the native RCS list restores. Record each once the
+// engine has processed work (values are final), restore after a domain reset;
+// masked registers as value|0xFFFF0000, as the native restore list does.
+struct TGLDomainRegister { uint32_t reg; bool masked; };
+constexpr TGLDomainRegister tglDomainRegisters[] {
+ {0x2050,true},{0x1A050,true},{0x20B4,false},{0x1A0A8,false},{0x1A058,false},{0x1A4D4,false},{0x1A0D4,true}
+};
+uint32_t tglDomainRegisterValues[arrsize(tglDomainRegisters)] {};
+bool tglDomainRegistersRecorded {};
+uint32_t tglDomainRegisterRestores {};
+void tglRecordDomainRegisters(const TGLCSBIO &io) {
+ if (tglDomainRegistersRecorded) return;
+ for (unsigned i=0;i<arrsize(tglDomainRegisters);++i) {
+  const uint32_t v=*reinterpret_cast<volatile uint32_t *>(io.bar+tglDomainRegisters[i].reg);
+  if (v==UINT32_MAX) return; // engine or forcewake not up yet: try again later
+  tglDomainRegisterValues[i]=tglDomainRegisters[i].masked ? (v&0xFFFF) : v;
+ }
+ tglDomainRegistersRecorded=true;
+}
+void tglRestoreDomainRegisters(void *streamer) {
+ if (!tglDomainRegistersRecorded) return;
+ TGLCSBIO io(streamer,0);io.acquire();
+ for (unsigned i=0;i<arrsize(tglDomainRegisters);++i) {
+  auto reg=reinterpret_cast<volatile uint32_t *>(io.bar+tglDomainRegisters[i].reg);
+  *reg=tglDomainRegisters[i].masked ? (tglDomainRegisterValues[i]|0xFFFF0000) : tglDomainRegisterValues[i];
+ }
+ (void)*reinterpret_cast<volatile uint32_t *>(io.bar+tglDomainRegisters[0].reg);
+ ++tglDomainRegisterRestores;
+}
 void tglCSBRecordHWS(const TGLCSBIO &io) {
  const auto base=tglEngineBase(io);
  if (!base || io.engine>=arrsize(tglHWSPGA)) return;
@@ -17903,10 +18391,38 @@ void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  engine.hardwareReady=true;++engine.resets;
 }
 
+// Read-only display-side state for RCS scanline waits (WAIT_ON_SCANLINE stalls).
+// Display registers need no GT forcewake. Only pipe A (the internal panel,
+// powered while the screen is on) is read; DE_RRMR's unmasked bit tells which
+// pipe a pending MI_WAIT_FOR_EVENT targets (bit0 A, bit8 B, bit14 C), so a
+// wait on B or C is identified without touching an unpowered power well.
+// Schema 1: [uptime, ready, DE_RRMR, PIPEDSL_A x2, PIPE_FRMCNT_A x2, TRANSCONF_A,
+//            PIPESRC_A, gap ns]. Two DSL/FRMCNT samples 200 us apart show
+// whether pipe A is actually scanning.
+bool tglDisplaySyncSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[10] {};clock_get_uptime(&q[0]);
+ auto owner=static_cast<uint8_t *>(tglHost.owner);
+ auto bar=owner ? *reinterpret_cast<volatile uint8_t **>(owner+0x1240) : nullptr;
+ if (bar && tglHost.barSize>=0x80000) {
+  auto rd=[&](uint32_t r){return static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(bar+r));};
+  q[1]=1;q[2]=rd(0x44050);
+  uint64_t t0 {},t1 {};clock_get_uptime(&t0);
+  q[3]=rd(0x70000);q[5]=rd(0x70040);
+  IODelay(200);
+  q[4]=rd(0x70000);q[6]=rd(0x70040);clock_get_uptime(&t1);
+  q[7]=rd(0x70008);q[8]=rd(0x6001C);
+  absolutetime_to_nanoseconds(t1-t0,&q[9]);
+ }
+ auto out=OSData::withBytes(q,sizeof(q));if(!out)return false;
+ const bool ok=out->serialize(serializer);out->release();return ok;
+}
+
 bool tglCSBModeSerialize(void *,void *,OSSerialize *serializer) {
  // {schema, per engine x6: GFX_MODE at last init/reset, mode restores, recorded HWS_PGA,
  //  HWS_PGA restores, sibling re-inits after a shared render/compute reset}
- uint32_t out[52] {114};
+ uint32_t out[54] {115};
+ out[52]=tglDomainRegisterRestores; // PSMI_CTL/EMR/CCS registers restored after a domain reset
+ out[53]=tglDomainRegistersRecorded;
  for (unsigned i=0;i<6;++i) out[44+i]=tglFailedQueues[i]; // killed channels' command queues marked failed
  out[50]=tglFenceLockBusy; // fence machine lock busy at marking time
  out[51]=tglFenceDirect; // of those, marked by the lock-free walk
@@ -18133,6 +18649,7 @@ void tglSkipGuiltyQueue(void *streamer,unsigned engine) {
 
 void XE::wrapTGLCSBReset(void *streamer) {
  tglCSBSnapshot(streamer,0);
+ TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::ResetBefore,streamer,0,0);
  // Runs after GDRST and the donor's register restore, before CSB reset and
  // resubmission. Gen12 render and compute share one reset domain: resetting either
  // resets both, and the reset clears registers the donor programs only at start:
@@ -18161,6 +18678,7 @@ void XE::wrapTGLCSBReset(void *streamer) {
   reinterpret_cast<void (*)(void *)>(tglInitHWSRegisters)(owner);
   ++tglDomainReinits;
  }
+ if (domain) tglRestoreDomainRegisters(streamer);
  tglCSBRestoreHWS(streamer);
  tglCSBRestoreMode(streamer);
  tglCSBInitialize(streamer);
@@ -18188,6 +18706,7 @@ void XE::wrapTGLCSBReset(void *streamer) {
   if (c.forced && self<arrsize(tglStampCompletions)) ++tglStampCompletions[self];
  }
  tglCSBSnapshot(streamer,1);
+ TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::ResetAfter,streamer,0,0);
  // Same reset processing for each wiped sibling (it resubmits its own in-flight
  // element, if any). Its HWS_PGA is now restored, so it cannot recurse back.
  for (unsigned i=0;i<arrsize(tglCSBEngines);++i) if (wiped[i]) {
@@ -18201,6 +18720,7 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
  // First processed event proves the donor's status page is live: record it once.
  if (io.engine<arrsize(tglHWSPGA) && !tglHWSPGA[io.engine]) tglCSBRecordHWS(io);
+ if (!tglDomainRegistersRecorded && tglEngineBase(io)==0x2000) {io.acquire();tglRecordDomainRegisters(io);}
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
   PANIC("igfx","CSB12 native/software head mismatch e=%u",io.engine);
@@ -18268,7 +18788,11 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
     tglHostCSBFatal("ElementSwitch-second-item-null",words);
    }
   }
+  TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::CSBBefore,streamer,
+   handler|static_cast<uint32_t>(event.kind)<<8|sample.index<<16,sample.raw);
   tglCSBMethods[handler](streamer,&entry);
+  TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::CSBAfter,streamer,
+   handler|static_cast<uint32_t>(event.kind)<<8|sample.index<<16,sample.raw);
   if (record) {
    // Existing fixed history: native return and resulting banks, no MMIO/wait.
    uint64_t banks[12];tglHostBanks(io.streamer,banks);
@@ -19064,7 +19588,9 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    reinterpret_cast<uint64_t>(streamer),tglCSBEngines[0].resets,read,force);
  } else if(tglSameTailEnabled && streamer==tglCSBEngines[0].streamer)tglSameTailState.previous={};
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,0);
+ TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::SubmitBefore,streamer,flags,0);
  FunctionCast(wrapTGLHostSubmit,callbackXE->orgTGLHostSubmit)(streamer,flags);
+ TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::SubmitAfter,streamer,flags,0);
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,1);
  adlnQueueTraceSubmitFinish(queueTraceMask,renderWakeOwner);
  if(executionSlot!=UINT32_MAX) {

@@ -15,6 +15,7 @@
 #include "kern_dsi_native_backing.hpp"
 #include "kern_dsi_native_mode.hpp"
 #include "kern_xe.hpp"
+#include "kern_hdmi_audio.hpp"
 #include "kern_framebuffer_donor.hpp"
 #include "kern_xelp_os.hpp"
 #include "kern_xelp_call_target.hpp"
@@ -4402,6 +4403,7 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
+	if(xeProfile.mobileDisplay13())WEXHDMIAudio::wakeEarly(physicalGPU); // -wex-hdmi-audio only
     // ADLP_LOAD_ONLY_KERNEL: do not enter TGL MMIO/FIA, bootstrap or VM setup.
     const auto physicalEntry=XELP::deviceEntry(xeProfile.identity);
     adlpLoadOnly=physicalEntry && xeProfile.mobileDisplay13() &&
@@ -5612,6 +5614,7 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 	display13FBOutputHooksReady=processDisplay13FramebufferOutput(patcher,index,address,size);
     if(adlnOutputWiring.panel)processDisplay13Panel(patcher,index,address,size);
     display13FBTCHooksReady=processDisplay13FramebufferTC(patcher,index,address,size);
+    WEXHDMIAudio::processFramebuffer(patcher,index,address,size); // -wex-hdmi-audio only
     if(!(adlnOutputWiring.selected()&0x78) && adlnOutputWiring.panel)processDisplay13Training(patcher,index,address,size);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCHooksReady",display13FBTCHooksReady);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBOutputHooksReady",display13FBOutputHooksReady);
@@ -8838,6 +8841,13 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
   that->setProperty("N97SharedFramebuffer",shared,sizeof(shared));
   if(auto power=OSSerializer::forTarget(that,adlnGTPowerSerialize)) {
    that->setProperty("N97GTPowerSample",power);power->release();
+  }
+  // -wex-hdmi-audio: codec wake here if processKernel could not map the GPU.
+  if(display13FBPower.controller==that && display13FBPower.map && display13FBPower.map->getLength()==0x1000000 &&
+     display13FBPower.map->getVirtualAddress()) {
+   auto mmio=reinterpret_cast<volatile uint8_t *>(display13FBPower.map->getVirtualAddress());
+   const auto wells=*reinterpret_cast<volatile uint32_t *>(mmio+0x45404);
+   if(wells!=UINT32_MAX && (wells&3)==3)WEXHDMIAudio::wakeFramebuffer(mmio);
   }
  }
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferStartAccepted",accepted);

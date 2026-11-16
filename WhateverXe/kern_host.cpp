@@ -46,6 +46,7 @@ static const char *hdaMainPath[] {
 static KernelPatcher::KextInfo hdaMain { "com.apple.driver.AppleHDA",hdaMainPath,arrsize(hdaMainPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 bool wexHDAMainProcess(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 bool wexFBNotifyTraceProcess(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
+void wexResolveAccelFence(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 void XeHost::init() {
  callbackHost=this;
  // Copy the firmware tables while the boot firmware still owns them. This
@@ -178,6 +179,7 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   return;
  }
  if(accelFamily.loadIndex==index) {
+  wexResolveAccelFence(patcher,index,address,size); // GPU-reset error reporting (kern_xe.cpp)
   if(!systemWakeRecovery || accelSeen)return;
   // Only the first loop of system_will_sleep(false) opens mode changes.
   // Leave its subsequent orphan cleanup and the hardware sleep phase native.

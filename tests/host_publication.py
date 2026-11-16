@@ -91,6 +91,7 @@ KernelPatcher::KextInfo hdaController{"com.apple.driver.AppleHDAController",99};
 KernelPatcher::KextInfo hdaMain{"com.apple.driver.AppleHDA",98};
 bool wexHDAMainProcess(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}
 bool wexFBNotifyTraceProcess(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}
+void wexResolveAccelFence(KernelPatcher&,size_t,mach_vm_address_t,size_t){}
 bool checkKernelArgument(const char*){return false;}
 bool wexHDADeferProcess(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}
 using IOSimpleLock=int;int scopeLock=0;uintptr_t fakeThread=1;

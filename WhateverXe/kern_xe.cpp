@@ -11899,6 +11899,12 @@ bool tglInstallEncodeGuard(KernelPatcher &patcher,size_t index,mach_vm_address_t
  const auto base=reinterpret_cast<const uint8_t *>(address);
  bool ready=true;
  for(uint32_t i=0;i<TGLEncodeGuard::Count;++i) {
+  // MediaKernel is NOT guarded: the video driver also submits media-kernel
+  // tokens for ordinary playback post-processing (colour conversion/scaling of
+  // decoded frames). Rejecting them left frames unwritten - green tearing on
+  // every Aerial video on the XPS 13 9320 (160 rejections, no encode session).
+  // Encode itself still goes through the three remaining encode paths.
+  if(i==TGLEncodeGuard::MediaKernel)continue;
   const auto &site=TGLEncodeGuard::sites[i];
   const auto solved=patcher.solveSymbol<mach_vm_address_t>(index,site.symbol,address,size);
   patcher.clearError();
@@ -11908,7 +11914,6 @@ bool tglInstallEncodeGuard(KernelPatcher &patcher,size_t index,mach_vm_address_t
   using namespace TGLEncodeGuard;
   KernelPatcher::RouteRequest routes[] {
    {sites[EncodingCommon].symbol,tglEncodeReject<EncodingCommon>},
-   {sites[MediaKernel].symbol,tglEncodeReject<MediaKernel>},
    {sites[VDENC].symbol,tglEncodeReject<VDENC>},
    {sites[AVCPAK].symbol,tglEncodeReject<AVCPAK>},
   };

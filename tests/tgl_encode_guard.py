@@ -39,9 +39,14 @@ for _, _, _, length, data in sites:
 install = xe[xe.index('bool tglInstallEncodeGuard('):xe.index('bool XE::processTGLAccelerator(')]
 assert install.index('checkKernelArgument("-wex-tgl-hwenc")') < install.index('qualify(')
 assert install.index('ready=ready && TGLEncodeGuard::qualify') < install.index('if(ready) {')
-assert install.count('tglEncodeReject<') == 4 and 'routeMultiple' in install
-for path in ['EncodingCommon', 'MediaKernel', 'VDENC', 'AVCPAK']:
+assert install.count('tglEncodeReject<') == 3 and 'routeMultiple' in install
+for path in ['EncodingCommon', 'VDENC', 'AVCPAK']:
     assert f'{{sites[{path}].symbol,tglEncodeReject<{path}>}}' in install, path
+# MediaKernel carries playback post-processing too (XPS 13 9320: green frames on
+# every video when it was rejected): it must stay native and unqualified.
+assert 'tglEncodeReject<MediaKernel>' not in install
+assert 'if(i==TGLEncodeGuard::MediaKernel)continue;' in install
+assert install.index('if(i==TGLEncodeGuard::MediaKernel)continue;') < install.index('TGLEncodeGuard::qualify(')
 # Wrappers never call native encode code and fail through the native flag only.
 wrapper = xe[xe.index('template<TGLEncodeGuard::Path P> void tglEncodeReject'):xe.index('// Returns true when encode')]
 assert 'TGLEncodeGuard::reject(info);' in wrapper and 'FunctionCast' not in wrapper and 'org' not in wrapper

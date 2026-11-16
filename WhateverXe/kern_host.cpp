@@ -12,6 +12,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_iokit.hpp>
 #include <IOKit/pci/IOPCIDevice.h>
+void wexResolveAccelFence(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 static size_t hostInstructionSize(const uint8_t *bytes,size_t length) {
  uint8_t code[32] {};memcpy(code,bytes,length<sizeof(code)?length:sizeof(code));
  Disassembler::hde_t ins {};
@@ -175,6 +176,7 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   return;
  }
  if(accelFamily.loadIndex==index) {
+  wexResolveAccelFence(patcher,index,address,size); // GPU-reset error reporting (kern_xe.cpp)
   if(!systemWakeRecovery || accelSeen)return;
   // Only the first loop of system_will_sleep(false) opens mode changes.
   // Leave its subsequent orphan cleanup and the hardware sleep phase native.

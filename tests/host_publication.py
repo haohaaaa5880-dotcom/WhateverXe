@@ -89,6 +89,7 @@ KernelPatcher::KextInfo surface{"com.apple.iokit.IOSurface",6},backlight{"com.ap
 KernelPatcher::KextInfo kextIntelTGL{"com.apple.driver.AppleIntelTGLGraphics",2},kextIntelTGLFb{"com.apple.driver.AppleIntelTGLGraphicsFramebuffer",1};
 KernelPatcher::KextInfo hdaController{"com.apple.driver.AppleHDAController",99},hdaMain{"com.apple.driver.AppleHDA",98};
 namespace WEXHDMIAudio {bool requested(){return false;}bool processController(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}bool processMain(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}}
+void wexResolveAccelFence(KernelPatcher&,size_t,mach_vm_address_t,size_t){}
 using IOSimpleLock=int;int scopeLock=0;uintptr_t fakeThread=1;
 IOSimpleLock *IOSimpleLockAlloc(){return &scopeLock;}
 int IOSimpleLockLockDisableInterrupt(IOSimpleLock*){return 0;}

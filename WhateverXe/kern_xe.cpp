@@ -318,6 +318,9 @@ static bool tglBlitDeferredSerialize(void *,void *,OSSerialize *serializer) {
 
 namespace {
 uint32_t tglRecoveryCalls {}, tglRecoveryReturns {};
+TGLRecovery::Probe tglRecoveryProbe {{},
+	[](void *mmio,uint32_t offset)->uint32_t {return *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mmio)+offset);},
+	[](unsigned us) {IODelay(us);}};
 uint64_t tglRecoveryRecords[16][16] {};
 bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 	uint64_t data[2+16*16] {};
@@ -335,13 +338,20 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
-	const auto result=TGLRecovery::resetAndResume(channel);
+	const auto result=TGLRecovery::resetAndResume(channel,&tglRecoveryProbe);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
 		auto q=tglRecoveryRecords[n];q[0]=123;q[1]=n+1;q[2]=before;q[3]=after;
 		q[4]=reinterpret_cast<uintptr_t>(channel);q[5]=result.ring;
 		q[6]=result.context;q[7]=result.affected;q[8]=result.index;
 		q[9]=result.failuresBefore;q[10]=result.failuresAfter;q[11]=result.resetOK;
+		// Cross-engine release: busy|semaphore<<8|stalled<<16|resets<<24|resetOK<<32, IPEHR before|after<<32.
+		const auto &r=result.release;
+		q[12]=r.busy|(r.semaphore<<8)|(r.stalled<<16)|(uint64_t(r.resets)<<24)|(uint64_t(r.resetOK)<<32);
+		q[13]=r.ipehr|(uint64_t(r.ipehrAfter)<<32);
+		// Guilty-stamp completion: forced | stamp before<<8 (low 24 bits) | target<<32.
+		const auto &c=result.completion;
+		q[14]=uint64_t(c.forced)|(uint64_t(c.before&0xFFFFFF)<<8)|(uint64_t(c.target)<<32);
 		__atomic_store_n(&q[15],1,__ATOMIC_RELEASE);
 	}
 	__atomic_fetch_add(&tglRecoveryReturns,1,__ATOMIC_RELEASE);
@@ -14732,6 +14742,14 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					!memcmp(reinterpret_cast<void *>(address+0x4CA5F),failedAndResume,sizeof(failedAndResume));
 				patcher.clearError();
 				if (recoveryOK) {
+					// Engine identity for the cross-engine release: ring class vtables (ZTV+0x10).
+					const auto blit=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV24IGHardwareRingBufferBlit",address,size);
+					patcher.clearError();
+					const auto main=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV24IGHardwareRingBufferMain",address,size);
+					patcher.clearError();
+					tglRecoveryProbe.engines[0]={blit ? static_cast<uintptr_t>(blit+0x10) : 0,0x22000};
+					tglRecoveryProbe.engines[1]={main ? static_cast<uintptr_t>(main+0x10) : 0,0x2000};
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryReleaseReady",blit && main);
 					KernelPatcher::RouteRequest hook[] {{recovery,wrapTGLRecovery,orgTGLRecovery}};
 					recoveryOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
 				}
@@ -17747,19 +17765,101 @@ struct TGLCSBIO {
  }
 };
 
+// GFX_MODE bit 3 selects the 12-entry CSB that this consumer reads. It is set
+// once by the patched initModeRegisters, but an engine reset (GDRST) returns the
+// engine's GFX_MODE to 0 and the donor's register restore does not reinstate it:
+// the engine then writes a 6-entry CSB that the 12-entry consumer never sees, so
+// every completion after the reset is lost and the engine looks hung forever
+// (observed: engine 1 GFX_MODE 0, CSB events frozen, 13+ further resets).
+// Re-enable it on the reset path, after GDRST and before CSB pointer reset and
+// resubmission, as Linux execlists_resume -> enable_execlists does. Masked write.
+uint32_t tglCSBModeRestores[6] {};
+// Read-only reset snapshot (fixed storage, no allocation on the reset path).
+// Per engine, [0] before restore/initialize, [1] after the native reset returns:
+// {valid, engine base, GFX_MODE, CSB ptr, IMR, HWS_PGA, EXECLIST_STATUS lo, hi,
+//  RING_HEAD, RING_TAIL, RING_CTL, MI_MODE, IPEHR, ACTHD, RESET_CTL,
+//  GT intr enable 0x190030, BCS mask 0x1900A8, HWSP CSB tail (+0xBC), CSB entry 0 lo, entry 11 lo, resets}.
+uint32_t tglCSBResetSnap[6][2][21] {};
+void tglCSBSnapshot(void *streamer,unsigned slot) {
+ TGLCSBIO io(streamer,0);
+ if (io.engine>=6 || slot>1 || io.pointerReg<0x3A0) return;
+ io.acquire();
+ auto q=tglCSBResetSnap[io.engine][slot];const uint32_t base=io.pointerReg-0x3A0;
+ auto rd=[&](uint32_t off){return *reinterpret_cast<volatile uint32_t *>(io.bar+off);};
+ static constexpr uint32_t regs[] {0x29C,0x3A0,0xA8,0x80,0x234,0x238,0x34,0x30,0x3C,0x9C,0x68,0x74,0xD0};
+ q[0]=1;q[1]=base;
+ for (unsigned i=0;i<arrsize(regs);++i) q[2+i]=rd(base+regs[i]);
+ q[15]=rd(0x190030);q[16]=rd(0x1900A8);
+ q[17]=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+ q[18]=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0x40);
+ q[19]=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0x40+11*8);
+ q[20]=tglCSBEngines[io.engine].resets;
+}
+bool tglCSBSnapSerialize(void *,void *,OSSerialize *serializer) {
+ auto data=OSData::withBytes(tglCSBResetSnap,sizeof(tglCSBResetSnap));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+void tglCSBRestoreMode(void *streamer) {
+ TGLCSBIO io(streamer,0);
+ if (io.engine>=arrsize(tglCSBModeRestores)) return;
+ io.acquire();
+ auto reg=reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+ const uint32_t mode=*reg;
+ if (mode==UINT32_MAX || (mode&8)) return;
+ *reg=0x00080008;(void)*reg;
+ ++tglCSBModeRestores[io.engine];
+}
+
+// HWS_PGA (engine base +0x80) is the status page the engine writes its CSB and
+// completions to. Observed on RPL-P: after a compute (CCS) reset its HWS_PGA is 0
+// and the native reset does not reinstate it, so the engine reports into GGTT 0
+// and every later completion is lost. Gen12 render and compute share a reset
+// domain, so the same reset also wiped the render engine's HWS_PGA while the donor
+// re-initialized only CCS (WindowServer then freezes on RCS). Linux rewrites
+// HWS_PGA on every resume (set_hwsp). Record the value the donor programmed
+// before first submission and restore it on the reset path.
+uint32_t tglHWSPGA[6] {},tglHWSRestores[6] {},tglSiblingResets[6] {},tglDomainReinits {};
+uint32_t tglGuiltySkipped[6] {}; // guilty-context queued elements skipped (see tglSkipGuiltyQueue)
+uint32_t tglStampCompletions[6] {}; // per engine: in-flight channel stamps completed after reset
+mach_vm_address_t tglInitModeRegisters {},tglInitHWSRegisters {};
+uint32_t tglEngineBase(const TGLCSBIO &io) {return io.modeReg>=0x29C ? io.modeReg-0x29C : 0;}
+void tglCSBRestoreHWS(void *streamer) {
+ TGLCSBIO io(streamer,0);
+ const auto base=tglEngineBase(io);
+ if (!base || io.engine>=arrsize(tglHWSPGA) || !tglHWSPGA[io.engine]) return;
+ io.acquire();
+ auto reg=reinterpret_cast<volatile uint32_t *>(io.bar+base+0x80);
+ if (*reg==tglHWSPGA[io.engine]) return;
+ *reg=tglHWSPGA[io.engine];(void)*reg;
+ ++tglHWSRestores[io.engine];
+}
+void tglCSBRecordHWS(const TGLCSBIO &io) {
+ const auto base=tglEngineBase(io);
+ if (!base || io.engine>=arrsize(tglHWSPGA)) return;
+ const uint32_t v=*reinterpret_cast<volatile uint32_t *>(io.bar+base+0x80);
+ if (v && v!=UINT32_MAX && !tglHWSPGA[io.engine]) tglHWSPGA[io.engine]=v;
+}
+
 void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
  // Called before the first submission, wake reset, or GPU-reset replay. Never
  // at reset's return: that method can submit GPU work before it returns.
  engine.streamer=streamer;TGLCSB::initialize(engine.state,io);
  engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+ tglCSBRecordHWS(io);
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
 }
 
 bool tglCSBModeSerialize(void *,void *,OSSerialize *serializer) {
- uint32_t out[7] {107};
- for (unsigned i=0;i<6;++i) out[i+1]=tglCSBEngines[i].modeAtInit;
+ // {schema, per engine x6: GFX_MODE at last init/reset, mode restores, recorded HWS_PGA,
+ //  HWS_PGA restores, sibling re-inits after a shared render/compute reset}
+ uint32_t out[44] {112};
+ for (unsigned i=0;i<6;++i) out[38+i]=tglStampCompletions[i]; // in-flight stamps completed after reset
+ out[31]=tglDomainReinits; // render/compute domain register re-inits
+ for (unsigned i=0;i<6;++i) out[32+i]=tglGuiltySkipped[i]; // guilty-context queued elements skipped
+ for (unsigned i=0;i<6;++i) {out[i+1]=tglCSBEngines[i].modeAtInit;out[i+7]=tglCSBModeRestores[i];
+  out[i+13]=tglHWSPGA[i];out[i+19]=tglHWSRestores[i];out[i+25]=tglSiblingResets[i];}
  auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
@@ -17776,6 +17876,41 @@ bool tglCSBSerialize(void *,void *,OSSerialize *serializer) {
  auto data=OSData::withBytes(values,sizeof(values));if (!data) return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
+}
+
+// Read-only live engine registers, read on each registry query (never written).
+// Per engine slot (32 x u32): {streamer valid, MMIO base, RING_TAIL, RING_HEAD, HWS_PGA,
+//  HWSTAM, RING_IMR, EXECLIST_STATUS lo, hi, GFX_MODE, CSB PTR, software CSB head,
+//  HWSP CSB write pointer (+0xBC), HWSP entry[head] lo, hi, CSB consumed,
+//  v2 [16..]: IPEHR, ACTHD, EXECLIST_SQ_CONTENTS 0x510..0x51C (4), EXECLIST_CONTROL 0x550,
+//  MI_MODE, RING_CTL, active port (streamer+0x50), port0 slot0/slot1 element non-null,
+//  port1 slot0/slot1 element non-null, streamer+0x1C3C flag, schema 2}.
+// Engine registers fall back to defaults on an engine reset; compare a healthy and
+// a reset engine to find which one the donor's restore does not reinstate.
+bool tglEngineRegsSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[1+6*32] {2};
+ for (unsigned i=0;i<6;++i) {
+  auto &e=tglCSBEngines[i];auto q=out+1+32*i;
+  if (!e.streamer || !e.hardwareReady) continue;
+  TGLCSBIO io(e.streamer,0);io.acquire();
+  if (io.modeReg<0x29C) continue;
+  const uint32_t base=io.modeReg-0x29C;
+  auto rd=[&](uint32_t off) {return *reinterpret_cast<volatile uint32_t *>(io.bar+base+off);};
+  q[0]=1;q[1]=base;q[2]=rd(0x30);q[3]=rd(0x34);q[4]=rd(0x80);q[5]=rd(0x98);q[6]=rd(0xA8);
+  q[7]=rd(0x234);q[8]=rd(0x238);q[9]=rd(0x29C);q[10]=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
+  q[11]=e.state.head;q[12]=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+  const uint64_t entry=*reinterpret_cast<volatile uint64_t *>(io.hwsp+0x40+8*(e.state.head%12));
+  q[13]=static_cast<uint32_t>(entry);q[14]=static_cast<uint32_t>(entry>>32);q[15]=static_cast<uint32_t>(e.consumed);
+  q[16]=rd(0x68);q[17]=rd(0x74);
+  for (unsigned k=0;k<4;++k) q[18+k]=rd(0x510+4*k);
+  q[22]=rd(0x550);q[23]=rd(0x9C);q[24]=rd(0x3C);
+  auto st=static_cast<uint8_t *>(e.streamer);
+  q[25]=*reinterpret_cast<uint32_t *>(st+0x50);
+  for (unsigned k=0;k<4;++k) q[26+k]=*reinterpret_cast<void **>(st+0x30+8*k)!=nullptr;
+  q[30]=st[0x1C3C];q[31]=2;
+ }
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
 }
 
 bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -17840,6 +17975,14 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(modeSite,modeReplace,sizeof(modeReplace));
  }
  IORegistryEntry::getRegistryRoot()->setProperty("TGLCSB12ModePatched",ok);
+ // Register-only donor setup re-run after a render/compute domain reset (wrapTGLCSBReset).
+ if (ok) {
+  tglInitModeRegisters=address+0x28E1A;
+  const auto hws=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator31initHardwareStatusPageRegistersEv",address,size);
+  patcher.clearError();
+  tglInitHWSRegisters=hws==address+0x28F34 ? hws : 0;
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("TGLDomainReinitReady",tglInitModeRegisters && tglInitHWSRegisters);
  // The original reset writes head/tail itself before context replay. Keep those
  // stores but change their reset value, so it cannot undo initialize() above.
  const uint8_t find[] {0xB8,7,0,0,0,0x89,0x87,4,0x1C,0,0};
@@ -17856,6 +17999,8 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
  if (ok) {
   auto data=OSSerializer::forTarget(nullptr,tglCSBSerialize);
   if (data) {root->setProperty("TGLCSB12Live",data);data->release();}
+  if (auto regs=OSSerializer::forTarget(nullptr,tglEngineRegsSerialize)) {root->setProperty("TGLEngineRegsLive",regs);regs->release();}
+  if (auto snap=OSSerializer::forTarget(nullptr,tglCSBSnapSerialize)) {root->setProperty("TGLCSBResetSnap",snap);snap->release();}
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
   if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
  }
@@ -17878,12 +18023,116 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  return ok;
 }
 void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
+// Guilty-context skip. The native reset skips the hung (in-flight) element by
+// rewriting only its stamp into the freshly reset ring, but the same context's
+// queued elements are only marked for later replay (flag 0x8). When the owner
+// process is dying (teardown waits in IGAccelCommandQueue::commandQueueStop ->
+// finishEvent while holding the accelerator lock), that replay never comes; the
+// waited stamp never completes and eventTimeout reports no culprit because the
+// engine is not running that context: a permanent deadlock (observed, with
+// WindowServer and IGAccelEventMachine blocked behind IOServiceTerminateThread).
+// Linux skips every pending request of the guilty context. Mark them with the
+// donor's own stamp-only flag (0x2) so its loop completes their stamps instead.
+// Engine-reset path only, never for a sibling re-init.
+bool tglSiblingReinit {};
+void tglSkipGuiltyQueue(void *streamer,unsigned engine) {
+ auto st=static_cast<uint8_t *>(streamer);
+ const uint32_t port=*reinterpret_cast<uint32_t *>(st+0x50);
+ if (port>1) return;
+ auto element=*reinterpret_cast<uint8_t **>(st+0x30+16*port);
+ auto context=element ? *reinterpret_cast<uint8_t **>(element) : nullptr;
+ auto channel=context ? *reinterpret_cast<uint8_t **>(context+0xB8) : nullptr;
+ auto ring=channel ? *reinterpret_cast<uint8_t **>(channel+0x130) : nullptr;
+ auto owner=*reinterpret_cast<uint8_t **>(st+0x20);
+ if (!ring || !owner) return;
+ const int32_t slot=*reinterpret_cast<int32_t *>(ring+0x38);
+ if (slot<0 || slot>64) return;
+ auto queue=*reinterpret_cast<uint8_t **>(owner+0xAA0+8*slot);
+ if (!queue) return;
+ uint64_t head=*reinterpret_cast<uint64_t *>(queue+0x4000);
+ const uint64_t tail=*reinterpret_cast<uint64_t *>(queue+0x4048);
+ using Matches=bool (*)(void *,void *);
+ for (unsigned n=0;head!=tail && n<0x200;++n,head=(head+1)&0x1FF) {
+  auto entry=queue+(head<<5);
+  auto object=*reinterpret_cast<void **>(entry);
+  if (!object) continue;
+  if (!reinterpret_cast<Matches>((*reinterpret_cast<void ***>(object))[0x40/8])(object,context)) continue;
+  auto &flags=*reinterpret_cast<uint32_t *>(entry+0x1C);
+  if (flags&2) continue;
+  flags|=2;
+  if (engine<arrsize(tglGuiltySkipped)) ++tglGuiltySkipped[engine];
+ }
+}
+
 void XE::wrapTGLCSBReset(void *streamer) {
+ tglCSBSnapshot(streamer,0);
+ // Runs after GDRST and the donor's register restore, before CSB reset and
+ // resubmission. Gen12 render and compute share one reset domain: resetting either
+ // resets both, and the reset clears registers the donor programs only at start:
+ // RCU_MODE CCS enable (0x14800; without it the compute engine silently ignores
+ // every ELSQ load), GFX_MODE (12-entry CSB), FORCE_TO_NONPRIV whitelists and
+ // HWS_PGA. Observed after one CCS reset: CCS SQ loaded, EXECLIST_STATUS idle, no
+ // CSB event ever. Re-run the donor's own register-only setup for the domain, as
+ // Linux re-applies engine workarounds, mode and HWS on every engine resume.
+ unsigned self=arrsize(tglCSBEngines);uint32_t selfBase=0;uint8_t *owner=nullptr;
+ {TGLCSBIO io(streamer,0);self=io.engine;selfBase=tglEngineBase(io);owner=io.owner;}
+ auto renderDomain=[](uint32_t base){return base==0x2000 || base==0x1A000;};
+ const bool domain=renderDomain(selfBase);
+ // Find siblings this reset wiped BEFORE anything is restored (their HWS_PGA is
+ // gone); they need their own CSB reset and resubmission afterwards.
+ bool wiped[arrsize(tglCSBEngines)] {};
+ if (domain) for (unsigned i=0;i<arrsize(tglCSBEngines) && i<arrsize(tglHWSPGA);++i) {
+  auto &e=tglCSBEngines[i];
+  if (i==self || !e.streamer || !e.hardwareReady || !tglHWSPGA[i]) continue;
+  TGLCSBIO io(e.streamer,0);const auto base=tglEngineBase(io);
+  if (!renderDomain(base)) continue;
+  io.acquire();wiped[i]=*reinterpret_cast<volatile uint32_t *>(io.bar+base+0x80)!=tglHWSPGA[i];
+ }
+ if (domain && owner && tglInitModeRegisters && tglInitHWSRegisters) {
+  TGLCSBIO io(streamer,0);io.acquire();
+  reinterpret_cast<void (*)(void *)>(tglInitModeRegisters)(owner);
+  reinterpret_cast<void (*)(void *)>(tglInitHWSRegisters)(owner);
+  ++tglDomainReinits;
+ }
+ tglCSBRestoreHWS(streamer);
+ tglCSBRestoreMode(streamer);
  tglCSBInitialize(streamer);
+ if (!tglSiblingReinit) tglSkipGuiltyQueue(streamer,self);
+ // The reset kills this engine's in-flight element. IOAccel attributes the hang to
+ // one channel (often the waiter, e.g. WindowServer), but the channel that owned
+ // the killed work here may be another (observed: the hung compute client never
+ // completed). Note its stamp index before the native reset consumes the element.
+ int32_t killedStamp=-1;
+ {
+  auto st=static_cast<uint8_t *>(streamer);
+  const uint32_t port=*reinterpret_cast<uint32_t *>(st+0x50);
+  auto element=port<=1 ? *reinterpret_cast<uint8_t **>(st+0x30+16*port) : nullptr;
+  auto context=element ? *reinterpret_cast<uint8_t **>(element) : nullptr;
+  auto channel=context ? *reinterpret_cast<uint8_t **>(context+0xB8) : nullptr;
+  if (channel) killedStamp=*reinterpret_cast<int32_t *>(channel+0x20);
+ }
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+ // Its outstanding events can no longer complete on the GPU: complete them to the
+ // last issued value (event machine = accelerator+0x380), as for the attributed
+ // channel in TGLRecovery::resetAndResume. Never beyond the last issued value.
+ if (killedStamp>=0 && owner) {
+  const auto c=TGLRecovery::completeStamp(*reinterpret_cast<void **>(owner+0x380),static_cast<uint32_t>(killedStamp));
+  if (c.forced && self<arrsize(tglStampCompletions)) ++tglStampCompletions[self];
+ }
+ tglCSBSnapshot(streamer,1);
+ // Same reset processing for each wiped sibling (it resubmits its own in-flight
+ // element, if any). Its HWS_PGA is now restored, so it cannot recurse back.
+ for (unsigned i=0;i<arrsize(tglCSBEngines);++i) if (wiped[i]) {
+  ++tglSiblingResets[i];
+  const bool outer=tglSiblingReinit;tglSiblingReinit=true;
+  wrapTGLCSBReset(tglCSBEngines[i].streamer);
+  tglSiblingReinit=outer;
+ }
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ // First processed event proves the donor's status page is live: record it once.
+ if (io.engine<arrsize(tglHWSPGA) && !tglHWSPGA[io.engine]) tglCSBRecordHWS(io);
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
   PANIC("igfx","CSB12 native/software head mismatch e=%u",io.engine);

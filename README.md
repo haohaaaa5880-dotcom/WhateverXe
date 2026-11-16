@@ -80,6 +80,12 @@ If it is fixed at **60MB**, also add `-igfxdvmt` and set these iGPU properties u
 
 These settings are unnecessary at 96MB and do not increase firmware-allocated memory.
 
+### Optional boot arguments
+
+- `-wex-tgl-hwenc`: allow Tiger Lake hardware video encode (VideoToolbox H.264). It is refused by default; see [known issues](#known-issues-and-limits).
+- `-wex-tgl-posh`: keep position-only shading (POSH) paired contexts for Tiger Lake Metal graphics. They are disabled by default because they stall the render engine.
+- `-wex-tgl-no-poshfix`: do not repair the POSH fields (CTX_CTRL bit 4, POSH_LRCA) of a Tiger Lake render context after the native reset reloads the golden image.
+
 ### Other settings
 
 - Add `SSDT-PNLF` for internal-display brightness control.
@@ -101,7 +107,7 @@ Experimental and opt-in. Add `-wex-resume-park` when firmware lights the interna
 
 ## Tested features and known issues
 
-The common regression checks cover Metal, OpenGL, OpenCL, hardware H.264 encode/decode and HEVC decode. The table summarizes OS coverage and configuration-specific display features.
+The common regression checks cover Metal, OpenGL, OpenCL, hardware H.264 decode and HEVC decode; Tiger Lake hardware encode requires `-wex-tgl-hwenc`. The table summarizes OS coverage and configuration-specific display features.
 
 | Configuration | Verified coverage |
 | --- | --- |
@@ -122,6 +128,7 @@ System sleep/wake support is **experimental**. Tested configurations are MiniBoo
 
 - DisplayPort reconnection can cause black screens or freezes. Tiger Lake USB-C reconnection is also unreliable; Alder Lake-S DP output/reconnection can be slow.
 - Some image-conversion operations can crash applications.
+- Tiger Lake hardware video encode is disabled by default: on some configurations it hangs the GPU in a way that cannot be recovered and freezes the desktop. Hardware encode requests fail (for example, an export reports that it cannot encode) instead of falling back to software, because macOS still selects the hardware encoder on SMBIOS models that list it. Use an application's software encoder (such as x264) where available. Hardware decode is unaffected. Add `-wex-tgl-hwenc` to re-enable it.
 - Safari video may occasionally drop frames. FairPlay-protected playback is unsupported.
 - Up to three displays are supported. Resolutions beyond the tested configurations remain unverified.
 - With `-wex-edp-keep`, display sleep without `-wex-edp-blank`, or a mode with a different refresh rate or color depth, trains the panel link again and can leave the internal panel dark. System sleep that powers the display hardware off is untested with `-wex-edp-blank`.

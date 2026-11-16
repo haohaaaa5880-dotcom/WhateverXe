@@ -120,6 +120,9 @@
   "-wex-tgl-off": [
     "-igfxtgloff"
   ],
+  "-wex-tgl-hwenc": [],
+  "-wex-tgl-no-poshfix": [],
+  "-wex-tgl-posh": [],
   "-wex-tgl-prog-off": [
     "-tglprogoff"
   ],

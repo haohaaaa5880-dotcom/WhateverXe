@@ -22,6 +22,15 @@ assert body.index('target(initLoads[0])==address+initCopy') < body.index('applyL
 assert body.count('applyLookupPatch') == 1 and 'address+queueCopy);' in body
 assert 'before[12] {0,0,0x1C,0,0,0,0,0,0,0,0,0}, after[12] {0,0,0x0C,0,0,0,0,0,0,0,0,0}' in body
 assert 'tglInstallPOSHOff(patcher,address,size);' in xe[xe.index('bool XE::processTGLAccelerator('):][:8000]
+# The Alder Lake / Raptor Lake RCS profile owns and byte-validates the same
+# queue parameters (0xB0BC0); patching them first made it reject and the
+# accelerator never start (XPS 17 9720). POSH off only where that profile is absent,
+# decided by the profile's own condition, before it runs.
+proc = xe[xe.index('bool XE::processTGLAccelerator('):][:8000]
+gate = 'const bool adlRCSProfile=adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested);'
+assert gate in proc
+assert proc.index(gate) < proc.index('if(!adlRCSProfile)tglInstallPOSHOff(patcher,address,size);') < proc.index('if(adlRCSProfile)adlnPrepareRCSProfile(patcher,index,address,size);')
+assert proc.count('tglInstallPOSHOff(patcher,address,size);') == 1
 m = re.search(r'queueCopy=0x([0-9A-F]+), initCopy=0x([0-9A-F]+), queueLoad=0x([0-9A-F]+), initLoads\[2\] \{0x([0-9A-F]+),0x([0-9A-F]+)\}', body)
 queue, init, qload, il0, il1 = (int(x, 16) for x in m.groups())
 

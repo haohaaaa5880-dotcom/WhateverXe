@@ -14284,8 +14284,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  tglInstallContextOwners(patcher,index,address,size);
  tglInstallGTFreqFloor(patcher,index,address,size);
  tglInstallOrphanStamp(patcher,index,address,size);
- tglInstallPOSHOff(patcher,address,size);
- if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
+ // The Alder Lake / Raptor Lake RCS profile (adlnPrepareRCSProfile) owns the
+ // queue-context parameters at 0xB0BC0 and validates their native bytes; there
+ // POCS/POSH is handled by that profile. Patching them first (POSH off) made the
+ // profile reject and the accelerator never start (XPS 17 9720, 2026-11-16).
+ // Apply the Tiger Lake POSH-off patch only where no such profile is installed.
+ const bool adlRCSProfile=adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested);
+ if(!adlRCSProfile)tglInstallPOSHOff(patcher,address,size);
+ else IORegistryEntry::getRegistryRoot()->setProperty("TGLPOSHOff",false);
+ if(adlRCSProfile)adlnPrepareRCSProfile(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
    {

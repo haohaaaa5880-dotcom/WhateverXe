@@ -90,6 +90,10 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - ファームウェアが点灯させた内蔵パネルのポートが起動時に拒否される場合（ポートがネイティブのモード0のまま残る場合）は、`-wex-panel-handoff`でファームウェアからの引き継ぎ時にそのポートを受け入れます。VBTのパネルDDIだけが対象で、通常の受け入れ処理で受け入れられなかった場合にのみ適用されます。
 - USB-Cコネクタ上のHDMI / DisplayPort出力が表示されない場合は、そのコネクタがType-Cのオルタネートモードではなく固定のDP/HDMI経路に配線されていないか確認し、該当ポートに`-wex-tcN-legacy`（N = 1〜4、Type-Cポート番号）を追加します。
 
+### 任意: HDMI / DisplayPortオーディオ
+
+実験的な任意設定です。Alder Lake-H/P/U / Raptor Lake-H/P/Uで外部ディスプレイからオーディオを出力するには`-wex-hdmi-audio`を追加します。AppleHDAの読み込みが必要です（AppleHDAを含まないmacOS 26では、それを提供するkextを使用）。AppleALCも併用します。WEXがディスプレイのコーデックを起動し、AppleHDAが出力を構成するため、ディスプレイがオーディオ出力として表示されます。Alder Lake-HとDisplayPortモニタで確認しています。ディスプレイを抜き差しした後は、再起動するまでオーディオは戻りません。
+
 ### 任意: ハイバネーションからの復帰
 
 実験的な任意機能です。ハイバネーション (`hibernatemode 25`) からの復帰時にfirmwareが内蔵eDPパネルを点灯させ、その後パネルが真っ暗のままになる場合は `-wex-resume-park` を追加します。WEXはディスプレイの復帰前にそのfirmwareの出力だけを停止し、それ以外のディスプレイ構成は変更しません。firmwareによっては、ハイバネーションイメージを復元するためにOpenCoreの `UEFI > ReservedMemory` の設定も必要です。内蔵パネルはfirmwareが設定したモードのままになります。

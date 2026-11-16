@@ -90,6 +90,10 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - If the internal panel's port is rejected at boot even though the firmware lit it (the port is left in native mode 0), `-wex-panel-handoff` admits that port at the firmware hand-off. It applies only to the VBT panel DDI and only when the normal admission did not already accept it.
 - If an HDMI or DisplayPort output on a USB-C connector stays dark, check whether the connector is actually wired to a fixed DP/HDMI route rather than Type-C alt mode, and add `-wex-tcN-legacy` (N = 1-4, the Type-C port number) for that port.
 
+### Optional: HDMI / DisplayPort audio
+
+Experimental and opt-in. Add `-wex-hdmi-audio` for audio through an external display on Alder Lake-H/P/U / Raptor Lake-H/P/U. AppleHDA must be loaded (on macOS 26, which no longer includes it, through a kext that provides it), together with AppleALC. WEX wakes the display codec and lets AppleHDA build its outputs; the display then appears as an audio output. Tested on Alder Lake-H with a DisplayPort monitor. After the display is unplugged and plugged in again, audio returns only after a restart.
+
 ### Optional: hibernation resume
 
 Experimental and opt-in. Add `-wex-resume-park` when firmware lights the internal eDP panel during a hibernation (`hibernatemode 25`) resume and the panel stays blank afterwards. WEX turns off only that firmware output before the display resume; other display configurations are left unchanged. Some firmware also needs an OpenCore `UEFI > ReservedMemory` entry for the hibernation image to restore. The internal panel keeps the mode the firmware programmed.

@@ -327,9 +327,11 @@ uint32_t tglRecoveryCalls {}, tglRecoveryReturns {};
 TGLRecovery::Probe tglRecoveryProbe {{},
 	[](void *mmio,uint32_t offset)->uint32_t {return *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mmio)+offset);},
 	[](unsigned us) {IODelay(us);}};
-// Record schema 125: 32 qwords, ready flag in q[31].
+// Record schema 127: 32 qwords, ready flag in q[31]. q[12..13,15]: Blit
+// completion (status, target, observed) (0.8.3).
 constexpr unsigned tglRecoveryWords=32;
 uint64_t tglRecoveryRecords[16][tglRecoveryWords] {};
+TGLRecovery::StampOps tglRecoveryStamp {};
 TGLResetTrace::Ring tglResetTrace;
 bool tglDisplaySyncSerialize(void *,void *,OSSerialize *serializer);
 inline uint64_t tglTraceNow() { uint64_t t {};clock_get_uptime(&t);return t; }
@@ -455,11 +457,11 @@ void XE::wrapTGLRecovery(void *channel) {
 	}
 	// Render-domain register restore, sibling re-init and lost-work completion
 	// run in the reset path itself (wrapTGLCSBReset), whichever caller reached it.
-	const auto result=TGLRecovery::resetAndResume(channel,&tglRecoveryProbe);
+	const auto result=TGLRecovery::resetAndResume(channel,tglRecoveryStamp,&tglRecoveryProbe);
 	tglHangFinish(channel);
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
-		auto q=tglRecoveryRecords[n];q[0]=126;q[1]=n+1;q[2]=before;q[3]=after;
+		auto q=tglRecoveryRecords[n];q[0]=127;q[1]=n+1;q[2]=before;q[3]=after;
 		q[4]=reinterpret_cast<uintptr_t>(channel);q[5]=result.ring;
 		q[6]=result.context;q[7]=result.affected;q[8]=result.index;
 		q[9]=result.failuresBefore;q[10]=result.failuresAfter;q[11]=result.resetOK;
@@ -470,6 +472,8 @@ void XE::wrapTGLRecovery(void *channel) {
 		// Attributed-channel stamp completion: forced | stamp before<<8 (low 24 bits) | target<<32.
 		const auto &c=result.completion;
 		q[14]=uint64_t(c.forced)|(uint64_t(c.before&0xFFFFFF)<<8)|(uint64_t(c.target)<<32);
+		// Blit completion (0.8.3): status (0 not run, 1 complete, 2 timed out), target, observed.
+		q[15]=static_cast<uint8_t>(result.stamp);q[16]=result.targetStamp;q[17]=result.observedStamp;
 		__atomic_store_n(&q[tglRecoveryWords-1],1,__ATOMIC_RELEASE);
 	}
 	__atomic_fetch_add(&tglRecoveryReturns,1,__ATOMIC_RELEASE);
@@ -7227,7 +7231,7 @@ struct Display13FBPowerIO {
 struct Display13FBPanelIO : Display13FBPowerIO {
  explicit Display13FBPanelIO(IOMemoryMap *m):Display13FBPowerIO{m} {}
  void write(uint32_t r,uint32_t v) {
-  if(r==0xC2020 || r==0xC8250 || r==0xC8258)
+  if(r==0xC2020 || r==0xC8250 || r==0xC8254 || r==0xC8258)
    *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;
   else Display13FBPowerIO::write(r,v);
  }
@@ -8388,10 +8392,9 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 	for(unsigned i=0;i<4;++i)check[19+i]=io.read(otherBanks[i]+4)&~io.read(otherBanks[i]-4);
     if(c.powerLost && !c.quiescing) {
         c.status=Display13FBIRQ::restoreAfterPowerLoss(io,c.state,c.admittedPipes);
-        if(c.status==Display13FBIRQ::Status::Complete) {c.powerLost=false;c.rearmPending=false;}
-        else if(Display13FBIRQ::deferRearm(io,c.state))c.rearmPending=true;
-    } else if(!c.quiescing && !c.state.enabled && Display13FBIRQ::deferRearm(io,c.state)) {
-        // Display wake: no pipe runs yet. enable() would fault permanently.
+        if(c.status==Display13FBIRQ::Status::Complete){c.powerLost=false;c.rearmPending=false;}
+        else if(Display13FBIRQ::deferRearm(io,c.state,c.admittedPipes))c.rearmPending=true;
+    } else if(!c.quiescing && !c.state.enabled && Display13FBIRQ::deferRearm(io,c.state,c.admittedPipes)) {
         c.status=Display13FBIRQ::Status::Topology;c.rearmPending=true;
     } else if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {
         const auto admitted=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);
@@ -8416,6 +8419,7 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 		if(parked==Display13FBIRQ::Status::Complete)c.state.active=0;
 		c.status=parked==Display13FBIRQ::Status::Complete ? Display13FBIRQ::Status::Power : parked;
 	} else c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,display13HotplugPorts(callbackXE->adlnOutputWiring),callbackXE->adlnOutputWiring.typeC);
+	if(c.status==Display13FBIRQ::Status::Complete)c.rearmPending=false;
 	adlnIRQCache(controller,io);adlnIRQRecord(record,1);
 	check[23]=static_cast<uint32_t>(c.status);check[24]=c.state.begun;
 	check[25]=c.state.enabled;check[26]=c.state.faulted;check[27]=c.state.active;check[28]=c.state.configured;
@@ -8534,7 +8538,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 		path->getMetaClass()->getClassSize()>=0x3730;
 	const auto pipe=valid ? Display13FBMemory::field<uint32_t>(path,0x3640) : 3;
 	c.state.sinceVBlank=0; // native VBL control activity: not an interrupt storm
-	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && (c.quiescing || (pipe<3 && (c.blockedPipes&(1U<<pipe))))) {
+	if(c.quiescing || (pipe<3 && (c.blockedPipes&(1U<<pipe)))) {
 		c.status=Display13FBIRQ::Status::Power;adlnIRQCache(controller,io);
 		if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;
 	}
@@ -8550,12 +8554,12 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 			if(c.powerLost)rearm=Display13FBIRQ::restoreAfterPowerLoss(io,c.state,admitted);
 			else {
 				const auto excluded=controller==callbackXE->adlnTopologyController ?
-					Display13FBTopology::excludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
+					display13ExcludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
 				const auto actual=Display13FBIRQ::readActivePipes(io,admitted,c.state.transcoders);
 				rearm=actual.status!=Display13FBIRQ::Status::Complete ? actual.status :
 					Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),
 						Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) ? actual.active : 1U,
-						callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
+						display13HotplugPorts(callbackXE->adlnOutputWiring),callbackXE->adlnOutputWiring.typeC);
 			}
 			if(rearm==Display13FBIRQ::Status::Complete) {c.powerLost=false;c.rearmPending=false;}
 		}
@@ -8568,7 +8572,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 		// the full pipe bank only at that real activation boundary after idle HPD.
 		// Also re-arm a bank parked off (not enabled) by the single-output branch of
 		// wrapDisplay13FBEnableIRQ while the pipe was down.
-		if(!Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && enabled && c.state.begun && (!c.state.enabled || !c.state.active) && !c.state.faulted &&
+		if(!Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && enabled && !c.quiescing && c.state.begun && (!c.state.enabled || !c.state.active) && !c.state.faulted &&
 			Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),pipe) && Display13Transcoder::running(io,pipe,c.state.transcoders)) {
 			const auto excluded=controller==callbackXE->adlnTopologyController ?
 				display13ExcludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
@@ -10002,7 +10006,8 @@ bool XE::display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t 
  const bool selected=port && access==c.access;
  if(selected) {
   auto &deferred=display13DeferredClocks[pipe];
-  if(display13SSTPort(port) && c.bridge.pipeHeld(power,pipe) && !deferred.pending && !(value&0xf0000000U))deferred={port,value,true};
+  if(display13SSTPort(port) && c.bridge.pipeHeld(power,pipe) && !(value&0xf0000000U) &&
+     (!deferred.pending || (deferred.port==port && deferred.value==value)))deferred={port,value,true};
   else adlnFault(c.clockFaulted,__LINE__);
  }
  IOLockUnlock(c.lock);return selected;
@@ -10097,26 +10102,12 @@ uint8_t *XE::display13SSTPort(void *port) {
  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
     !(s->adlnOutputWiring.links()&(1U<<config[0])) || p[0x117] ||
     Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] ||
+    // The native constructor leaves Combo mode unset until setPortMode.
+    // Firmware handoff and the first link operation may precede that call.
+    // TC modes still require their actual negotiated owner (3/4).
+    (config[0]>=3 ? Display13FBMemory::field<uint32_t>(p,0x550)!=((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U) :
+                   Display13FBMemory::field<uint32_t>(p,0x550)>1U) ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
- const auto ddi=config[0],mode=Display13FBMemory::field<uint32_t>(p,0x550);
- const auto expected=ddi>=3?((s->adlnOutputWiring.typeC&(1U<<ddi))?3U:4U):1U;
- if(mode!=expected) {
-    // A native port can still have its zero-initialized software mode when
-    // adopting the running firmware eDP A. Do not write a guessed mode or
-    // admit other mode0 ports: require the pending protected boot AUX lease,
-    // or the very same port already bound to that lease after path adoption.
-    if(mode || ddi || !(s->adlnOutputWiring.panel&1) || !s->firmwarePorts.panel.valid ||
-       s->firmwarePorts.panel.ddi || !c.bridge.begun || c.bridge.bootPort ||
-       c.bridge.state.faulted || c.bridge.state.suspended)return nullptr;
-    const auto &link=c.mainLink[0];
-    const bool pending=link.bootPending && !link.owner && !c.bridge.bootAdopted &&
-        c.bridge.bootPGProtected && c.bridge.bootDDIProtected;
-    const bool adopted=!link.bootPending && link.owner==reinterpret_cast<uintptr_t>(port) &&
-        c.bridge.bootAdopted && c.bridge.bootPath;
-    if((!pending && !adopted) || link.port || link.lease.owner!=&c.bridge.state ||
-       link.lease.domains!=Display13Power::dependencies(Display13Power::auxDomain(0)) ||
-       !c.bridge.state.refs[0] || !c.bridge.state.refs[8])return nullptr;
- }
  return p;
 }
 
@@ -11819,6 +11810,27 @@ void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBClockChange",&result,sizeof(result));
 }
 
+// Caller holds the display owner lock throughout this transaction.
+static void adlnSetColdClock(Display13FBClockIO &clockIO,uint64_t nativeHz,
+    Display13Clock::Change &result,uint64_t *evidence) {
+    auto &c=display13FBPower;
+    // Cold clock programming needs no peer framebuffer certificate.
+    // Keep the owner lock throughout: every WEX clock/WM/DBUF writer
+    // shares it. The guard additionally masks/drains IRQ handlers and
+    // checks every powered plane, cursor, DSB and transcoder, including
+    // unpublished consumers. Never wait for the workloop gate while a
+    // donor caller may hold a framebuffer mutex needed by that gate.
+    Display13FBClockGuard guard;
+    const bool idle=!Display13WM::busyPipes(c.pipe) && !c.dbuf.updating;
+    const bool cold=idle && adlnBeginClockGuard(guard);
+    evidence[14]=idle;evidence[15]=cold;
+    if(cold) {
+        result=Display13Clock::set(clockIO,nativeHz,{true,true,0},display13ClockVariant());
+        if(result.status==Display13Clock::ChangeStatus::Complete)adlnInvalidateWM();
+    }
+    adlnEndClockGuard(guard,result.status==Display13Clock::ChangeStatus::Complete || !result.writes);
+}
+
 // A shared crawl needs real WM certificates for every active native pipe.
 // Never wait for the controller gate or a peer FB mutex while a caller may
 // already own its own FB mutex. Single-output retains its established path.
@@ -11879,91 +11891,95 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
             return true;
         };
         bool ready=valid && measure(active);evidence[3]=active;
-        loop=c.workLoop;
-        evidence[5]=ready && loop && Display13FBMemory::field<IOWorkLoop *>(controller,0xE00)==loop;
-        evidence[6]=callbackXE->adlnWorkLoopInGate && callbackXE->adlnWorkLoopTryClose && callbackXE->adlnWorkLoopOpen;
-        ready=ready && evidence[5] && evidence[6];
-        if(ready) {
-            evidence[7]=reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(loop);
-            if(!evidence[7]) {
-                ready=reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop);
-                // Another thread can hold the gate for a moment (seen on eDP +
-                // TC HDMI cold boots). Retry briefly without the owner lock;
-                // the active-pipe set is re-validated after the relock below.
-                for(unsigned retry=0;!ready && retry<20;++retry) {
-                    IOLockUnlock(c.lock);IOSleep(5);
+        if(ready && !active) {
+            adlnSetColdClock(clockIO,nativeHz,result,evidence);
+        } else {
+            loop=c.workLoop;
+            evidence[5]=ready && loop && Display13FBMemory::field<IOWorkLoop *>(controller,0xE00)==loop;
+            evidence[6]=callbackXE->adlnWorkLoopInGate && callbackXE->adlnWorkLoopTryClose && callbackXE->adlnWorkLoopOpen;
+            ready=ready && evidence[5] && evidence[6];
+            if(ready) {
+                evidence[7]=reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(loop);
+                if(!evidence[7]) {
                     ready=reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop);
-                    IOLockLock(c.lock);evidence[27]=retry+1;
+                    // Another thread can hold the gate for a moment (seen on eDP +
+                    // TC HDMI cold boots). Retry briefly without the owner lock;
+                    // the active-pipe set is re-validated after the relock below.
+                    for(unsigned retry=0;!ready && retry<20;++retry) {
+                        IOLockUnlock(c.lock);IOSleep(5);
+                        ready=reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop);
+                        IOLockLock(c.lock);evidence[27]=retry+1;
+                    }
+                    if(ready) {acquired=loop;evidence[8]=1;}
+                    else {
+                        gateBusy=true;
+                        recordDisplay13GateBusy(loop,callbackXE->display13DPImage);
+                    }
                 }
-                if(ready) {acquired=loop;evidence[8]=1;}
-                else {
-                    gateBusy=true;
-                    recordDisplay13GateBusy(loop,callbackXE->display13DPImage);
+            }
+            if(ready)for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
+                auto fb=c.pipe[p].memoryFramebuffer;
+                if(!fb || fb->getMetaClass()->getClassSize()<0x4B90) {ready=false;break;}
+                for(unsigned q=0;q<p;++q)if(frames[q]==fb)ready=false;
+                if(!ready)break;
+                frames[p]=fb;fb->retain();mutexes[p]=Display13FBMemory::field<IORecursiveLock *>(fb,0x4220);
+                if(!mutexes[p]) {ready=false;break;}
+            }
+            IOLockUnlock(c.lock);
+            if(ready)for(unsigned p=0;p<3;++p)if(frames[p]) {
+                // TryLock also increments a caller-owned recursive mutex; balance
+                // only these successful invocations, never caller ownership.
+                locked[p]=IORecursiveLockTryLock(mutexes[p]);
+                if(!locked[p]) {ready=false;break;}
+                evidence[9]|=1U<<p;
+            }
+            IOLockLock(c.lock);
+            uint32_t actual=0;
+            ready=ready && controller==c.controller && loop==c.workLoop &&
+                Display13FBMemory::field<IOWorkLoop *>(controller,0xE00)==loop && measure(actual) && actual==active;
+            evidence[4]=actual;
+            if(ready) {
+                TGLFBBinding::PublishedPath paths[3];uintptr_t owners[3];
+                for(unsigned p=0;p<3;++p) {paths[p]=c.pipe[p].powerPath;owners[p]=reinterpret_cast<uintptr_t>(c.pipe[p].memoryFramebuffer);}
+                const auto map=TGLFBBinding::powerPipes(paths,owners,callbackXE->adlnOutputWiring.selected());
+                uint32_t published=0;for(unsigned d=0;d<7;++d)if(map.known&(1U<<d))published|=map.mask[d];
+                ready=map.valid && !(active&~published);
+                for(unsigned p=0;p<3 && ready;++p)if(active&(1U<<p)) {
+                    auto fb=frames[p];auto path=Display13FBMemory::singlePath<OSObject *>(fb);
+                    const auto binding=adlnInspectPathBinding(fb,path,callbackXE->adlnPlatform,callbackXE->adlnOutputWiring);
+                    ready=fb==c.pipe[p].memoryFramebuffer && !c.pipe[p].destroyingPath &&
+                        TGLFBBinding::publish(paths[p],reinterpret_cast<uintptr_t>(fb),reinterpret_cast<uintptr_t>(path),binding,p);
                 }
             }
-        }
-        if(ready)for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
-            auto fb=c.pipe[p].memoryFramebuffer;
-            if(!fb || fb->getMetaClass()->getClassSize()<0x4B90) {ready=false;break;}
-            for(unsigned q=0;q<p;++q)if(frames[q]==fb)ready=false;
-            if(!ready)break;
-            frames[p]=fb;fb->retain();mutexes[p]=Display13FBMemory::field<IORecursiveLock *>(fb,0x4220);
-            if(!mutexes[p]) {ready=false;break;}
-        }
-        IOLockUnlock(c.lock);
-        if(ready)for(unsigned p=0;p<3;++p)if(frames[p]) {
-            // TryLock also increments a caller-owned recursive mutex; balance
-            // only these successful invocations, never caller ownership.
-            locked[p]=IORecursiveLockTryLock(mutexes[p]);
-            if(!locked[p]) {ready=false;break;}
-            evidence[9]|=1U<<p;
-        }
-        IOLockLock(c.lock);
-        uint32_t actual=0;
-        ready=ready && controller==c.controller && loop==c.workLoop &&
-            Display13FBMemory::field<IOWorkLoop *>(controller,0xE00)==loop && measure(actual) && actual==active;
-        evidence[4]=actual;
-        if(ready) {
-            TGLFBBinding::PublishedPath paths[3];uintptr_t owners[3];
-            for(unsigned p=0;p<3;++p) {paths[p]=c.pipe[p].powerPath;owners[p]=reinterpret_cast<uintptr_t>(c.pipe[p].memoryFramebuffer);}
-            const auto map=TGLFBBinding::powerPipes(paths,owners,callbackXE->adlnOutputWiring.selected());
-            uint32_t published=0;for(unsigned d=0;d<7;++d)if(map.known&(1U<<d))published|=map.mask[d];
-            ready=map.valid && !(active&~published);
-            for(unsigned p=0;p<3 && ready;++p)if(active&(1U<<p)) {
-                auto fb=frames[p];auto path=Display13FBMemory::singlePath<OSObject *>(fb);
-                const auto binding=adlnInspectPathBinding(fb,path,callbackXE->adlnPlatform,callbackXE->adlnOutputWiring);
-                ready=fb==c.pipe[p].memoryFramebuffer && !c.pipe[p].destroyingPath &&
-                    TGLFBBinding::publish(paths[p],reinterpret_cast<uintptr_t>(fb),reinterpret_cast<uintptr_t>(path),binding,p);
-            }
-        }
-        const auto now=ready ? Display13Clock::read(clockIO,display13ClockVariant()) : Display13Clock::Readout {};
-        ready=ready && now.status==current.status && now.nativeHz()==current.nativeHz() &&
-            !c.bridge.state.faulted && !c.clockFaulted && !c.watermarkFaulted;
-        evidence[10]=ready;
-        Display13FBClockGuard guard;
-        if(ready) {
-            const bool idle=!Display13WM::busyPipes(c.pipe) && !c.dbuf.updating;
-            evidence[14]=idle;
-            const bool cold=idle && !active && adlnBeginClockGuard(guard);evidence[15]=cold;
-            const bool certified=idle && !c.dbuf.unretired && !c.dbuf.faulted &&
-                current.status==Display13Clock::Status::Complete && Display13WM::clockConsumersReady(c.pipe,active,current.nativeHz());
-            evidence[11]=certified;
-            if(certified)for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
-                before[p]=adlnVerifyWMLatch(frames[p],current.nativeHz(),nativeHz);
-                if(before[p].status==Display13WM::Status::Complete)evidence[12]|=1U<<p;
-            }
-            const bool activeReady=active && evidence[12]==active;
-            if(activeReady)for(unsigned p=0;p<3;++p)if(active&(1U<<p))c.pipe[p].watermarkClockHz=0;
-            result=Display13Clock::set(clockIO,nativeHz,{c.bridge.bootAdopted && (active || cold),idle && (cold || activeReady),active},display13ClockVariant());
-            if(cold && result.status==Display13Clock::ChangeStatus::Complete)adlnInvalidateWM();
-            if(activeReady && result.status==Display13Clock::ChangeStatus::Complete) {
-                for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
-                    after[p]=adlnVerifyWMLatch(frames[p],result.after.nativeHz(),nativeHz);c.pipe[p].wmLatch=after[p];
-                    if(after[p].status==Display13WM::Status::Complete) {c.pipe[p].watermarkClockHz=result.after.nativeHz();evidence[13]|=1U<<p;}
+            const auto now=ready ? Display13Clock::read(clockIO,display13ClockVariant()) : Display13Clock::Readout {};
+            ready=ready && now.status==current.status && now.nativeHz()==current.nativeHz() &&
+                !c.bridge.state.faulted && !c.clockFaulted && !c.watermarkFaulted;
+            evidence[10]=ready;
+            Display13FBClockGuard guard;
+            if(ready) {
+                const bool idle=!Display13WM::busyPipes(c.pipe) && !c.dbuf.updating;
+                evidence[14]=idle;
+                const bool cold=idle && !active && adlnBeginClockGuard(guard);evidence[15]=cold;
+                const bool certified=idle && !c.dbuf.unretired && !c.dbuf.faulted &&
+                    current.status==Display13Clock::Status::Complete && Display13WM::clockConsumersReady(c.pipe,active,current.nativeHz());
+                evidence[11]=certified;
+                if(certified)for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
+                    before[p]=adlnVerifyWMLatch(frames[p],current.nativeHz(),nativeHz);
+                    if(before[p].status==Display13WM::Status::Complete)evidence[12]|=1U<<p;
                 }
-                if(evidence[13]!=active) {adlnFault(c.watermarkFaulted,__LINE__);result.status=Display13Clock::ChangeStatus::ReadbackMismatch;}
+                const bool activeReady=active && evidence[12]==active;
+                if(activeReady)for(unsigned p=0;p<3;++p)if(active&(1U<<p))c.pipe[p].watermarkClockHz=0;
+                result=Display13Clock::set(clockIO,nativeHz,{c.bridge.bootAdopted && (active || cold),idle && (cold || activeReady),active},display13ClockVariant());
+                if(cold && result.status==Display13Clock::ChangeStatus::Complete)adlnInvalidateWM();
+                if(activeReady && result.status==Display13Clock::ChangeStatus::Complete) {
+                    for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
+                        after[p]=adlnVerifyWMLatch(frames[p],result.after.nativeHz(),nativeHz);c.pipe[p].wmLatch=after[p];
+                        if(after[p].status==Display13WM::Status::Complete) {c.pipe[p].watermarkClockHz=result.after.nativeHz();evidence[13]|=1U<<p;}
+                    }
+                    if(evidence[13]!=active) {adlnFault(c.watermarkFaulted,__LINE__);result.status=Display13Clock::ChangeStatus::ReadbackMismatch;}
+                }
+                adlnEndClockGuard(guard,result.status==Display13Clock::ChangeStatus::Complete || !result.writes);
             }
-            adlnEndClockGuard(guard,result.status==Display13Clock::ChangeStatus::Complete || !result.writes);
         }
     }
     if(result.status==Display13Clock::ChangeStatus::Complete) {
@@ -13002,7 +13018,7 @@ bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
         if(!c.resumeClockHz)c.resumeClockHz=c.clock.nativeHz();
         auto &irq=display13FBIRQ;
         const auto saved=IOSimpleLockLockDisableInterrupt(irq.lock);
-        irq.powerLost=true;
+        irq.powerLost=true;irq.rearmPending=true;
         IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
     }
     cold[0]=c.restorePending;cold[1]=c.restoreEpoch;
@@ -13045,18 +13061,15 @@ bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
             if(cold[4]!=c.dbuf.mbus)
                 *reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+0x4438C)=c.dbuf.mbus;
             cold[5]=io.read(0x4438C);
-            if(cold[5]!=c.dbuf.mbus)result.status=Display13Power::Status::NotReady;
-            else {
-                for(unsigned i=0;i<4;++i)
-                    if(!(io.read(Display13DBUF::regs[i])&Display13DBUF::Request))c.dbuf.owned&=~(1U<<i);
-                // Every consumer is stopped and no plane is enabled yet: restore
-                // the GGTT scanout mode the hibernation cold boot leaves clear.
-                // A failed readback is recorded only; it does not block resume.
-                uint32_t before=0,after=0;
-                Display13ResumePark::restoreGGTTMode([&](uint32_t r){return io.read(r);},
-                    [&](uint32_t r,uint32_t v){*reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+r)=v;},before,after);
-                cold[12]=before;cold[13]=after;
-            }
+            // GGTT scanout mode (CHICKEN_MISC_2 bit30): set with every consumer
+            // stopped; a failed readback keeps the restore pending (0.8.3).
+            if(cold[5]!=c.dbuf.mbus || !Display13Power::restoreGGTT(
+                [&](uint32_t r){return io.read(r);},
+                [&](uint32_t r,uint32_t v){*reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+r)=v;}))
+                result.status=Display13Power::Status::NotReady;
+            else for(unsigned i=0;i<4;++i)
+                if(!(io.read(Display13DBUF::regs[i])&Display13DBUF::Request))c.dbuf.owned&=~(1U<<i);
+            cold[12]=cold[13]=io.read(0x42084);
         }
     }
     if(result.status==Display13Power::Status::Complete &&
@@ -15244,10 +15257,10 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// target returns after native reset/resume; its lower-level reset still
 			// performs context replay. Port that CALLER contract only. No changed
 			// completion values, queue drops, hardware reset or panic entry points.
-			// IOAccel on Darwin 20-25 releases its recovery locks after this void
-			// callback returns. Native ICL uses the same single-pass caller; no host
-			// requires the TGL donor's extra stamp wait. Select by the firmware mode,
-			// exact donor and scheduler ABI, not by the OS used to observe a hang.
+			// A successful Blit reset has a bounded native completion path. Retain
+			// that one stamp without the retry path. Other engines and failed
+			// resets keep the single-pass reset/account/resume contract.
+			// Select by firmware mode and exact donor ABI, not host OS or machine.
 			const bool recoveryRequested=checkKernelArgument("-disablegfxfirmware");
 			bool recoveryOK=!recoveryRequested;
 			if (recoveryRequested) {
@@ -15257,14 +15270,27 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					0x49,0x8B,0x76,0x20,0x48,0x8B,0x9E,0xB8,0,0,0};
 				const uint8_t failedAndResume[] {0xFF,0x83,0x7C,0x01,0,0,0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x50,0x12,0,0,
 					0x48,0x8B,0x07,0xFF,0x90,0x80,0x01,0,0};
-				recoveryOK=hostOK && size>0xDF668 &&
+				const uint8_t successDispatch[] {0xFF,0x90,0x68,0x01,0,0,0x84,0xC0,0x74,0x09,0x41,0x80,0x7E,0x40,0,0x74,0x08,0xEB,0x72};
+				const uint8_t successPath[] {0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x50,0x12,0,0,0x48,0x8B,0x07,0xFF,0x90,0x80,0x01,0,0,
+					0x48,0x85,0xDB,0x74,0xDA,0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x80,0x03,0,0,0x8B,0x73,0x20,0x48,0x8B,0x07,0xFF,0x90,0xD8,0x01,0,0,
+					0x48,0x89,0xDF,0xE8,0xFD,0xF9,0xFF,0xFF,0x8B,0x93,0x78,0x01,0,0,0x48,0x8D,0x75,0xD8,0x4C,0x89,0xF7,0xB9,0x40,0x42,0x0F,0,
+					0xE8,0xC4,0x54,0xFF,0xFF,0x84,0xC0,0x74,0xA0,0xFF,0x83,0x7C,0x01,0,0,0xEB,0x98};
+				const uint8_t submitHead[] {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x10,0x48,0x8B,0x47,0x18,0xF6,0x80,0x78,0x0C,0,0,0x02};
+				const auto submit=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18IGAccelFIFOChannel18submitStampCommandEv",address,size);
+				// hostOK already qualifies and routes this exact sleep entry. Call
+				// the routed entry, as the native E8 does, not the saved trampoline.
+				recoveryOK=hostOK && orgTGLHostWait && size>0xDF668 && submit==address+0x4C506 &&
 					patcher.solveSymbol<mach_vm_address_t>(index,recovery,address,size)==address+0x4CA1E &&
 					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext",address,size)==address+0x43576 &&
 					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN12IGScheduler56resumeEv",address,size)==address+0x3906C &&
 					!memcmp(reinterpret_cast<void *>(address+0x4CA1E),head,sizeof(head)) &&
-					!memcmp(reinterpret_cast<void *>(address+0x4CA5F),failedAndResume,sizeof(failedAndResume));
+					!memcmp(reinterpret_cast<void *>(address+0x4CA5F),failedAndResume,sizeof(failedAndResume)) &&
+					!memcmp(reinterpret_cast<void *>(address+0x4CA4C),successDispatch,sizeof(successDispatch)) &&
+					!memcmp(reinterpret_cast<void *>(address+0x4CAD1),successPath,sizeof(successPath)) &&
+					!memcmp(reinterpret_cast<void *>(submit),submitHead,sizeof(submitHead));
 				patcher.clearError();
 				if (recoveryOK) {
+					tglRecoveryStamp={reinterpret_cast<TGLRecovery::SubmitStamp>(submit),reinterpret_cast<TGLRecovery::WaitStamp>(address+0x41FE4)};
 					// Engine identity for the cross-engine release: ring class vtables (ZTV+0x10).
 					const auto blit=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV24IGHardwareRingBufferBlit",address,size);
 					patcher.clearError();
@@ -16552,7 +16578,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 // Display13 panel operations use its own physical PG bridge. No display owner
 // lock spans a donor call: native AUX/clock callbacks reacquire that lock.
 void XE::processDisplay13Panel(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
- if(!adlnOutputWiring.panel || !XELP::PanelPower::nativePPS0(firmwarePorts,xeProfile.family))return;
+ if(!adlnOutputWiring.panel || !XELP::PanelPower::nativePPS0(firmwarePorts,xeProfile.family,true))return;
  if(!tglAUXLock)tglAUXLock=IOSimpleLockAlloc();
  if(!tglAUXLock)return;
  processNativePanel(patcher,index,address,size);
@@ -16564,6 +16590,7 @@ void XE::processDisplay13Panel(KernelPatcher &patcher,size_t index,mach_vm_addre
  if(size<=0x48B88 || target!=address+0x48652 ||
     memcmp(reinterpret_cast<void *>(target),entry,sizeof(entry)) ||
     memcmp(reinterpret_cast<void *>(address+0x4866b),configCall,sizeof(configCall)))return;
+ if(memcmp(reinterpret_cast<void *>(address+Display13Panel::PeriodSite),Display13Panel::periodBefore,sizeof(Display13Panel::periodBefore)))return;
  for(const auto &patch:Display13Panel::lightPatches)
   if(memcmp(reinterpret_cast<void *>(address+patch.offset),patch.before,patch.size))return;
  for(const auto &patch:Display13Panel::lightPatches) {
@@ -16572,6 +16599,14 @@ void XE::processDisplay13Panel(KernelPatcher &patcher,size_t index,mach_vm_addre
    !memcmp(reinterpret_cast<void *>(address+patch.offset),patch.after,patch.size);
   patcher.clearError();if(!ok)return;
  }
+ uint8_t periodBridge[sizeof(Display13Panel::periodBefore)];memset(periodBridge,0x90,sizeof(periodBridge));
+ periodBridge[0]=0x48;periodBridge[1]=0xB8;
+ const auto periodHandler=reinterpret_cast<uintptr_t>(display13PanelPWMPeriod);memcpy(periodBridge+2,&periodHandler,8);
+ periodBridge[10]=0xFF;periodBridge[11]=0xD0;
+ patcher.routeBlock(address+Display13Panel::PeriodSite,periodBridge,sizeof(periodBridge));
+ const bool periodReady=patcher.getError()==KernelPatcher::Error::NoError &&
+  !memcmp(reinterpret_cast<void *>(address+Display13Panel::PeriodSite),periodBridge,sizeof(periodBridge));
+ patcher.clearError();if(!periodReady)return;
  if(!display13FBPower.panelLock)display13FBPower.panelLock=IOLockAlloc();
  if(!display13FBPower.panelLock)return;
  KernelPatcher::RouteRequest route(symbol,wrapDisplay13PanelPower,orgDisplay13PanelPower);
@@ -16583,8 +16618,10 @@ bool XE::display13PanelTarget(void *controller) {
  auto s=callbackXE;auto &c=display13FBPower;
  return controller && controller==c.controller && controller==s->adlnTopologyController &&
   s->display13FramebufferRequested && s->adlnOutputWiring.panel && s->display13PanelPowerReady &&
-  XELP::PanelPower::nativePPS0(s->firmwarePorts,s->xeProfile.family) &&
-  adlnWriterMappingBound() && !c.clockStopped && !c.clockFaulted && !c.panelFaulted &&
+  XELP::PanelPower::nativePPS0(s->firmwarePorts,s->xeProfile.family,true) &&
+  // PCH PPS/PWM use the reference clock, not CDCLK. The native LightUpEDP
+  // calls panel power before setting CDCLK; require PG1 below, not a live pipe clock.
+  adlnWriterMappingBound() && !c.clockFaulted && !c.panelFaulted &&
   !c.bridge.state.faulted && !c.bridge.state.suspended &&
   Display13FBMemory::field<void *>(controller,0xD40)==s->adlnPlatform &&
   Display13FBMemory::field<void *>(controller,0xC8)==c.power &&
@@ -16608,7 +16645,7 @@ bool XE::display13PanelCapture(void *controller) {
  Display13FBPanelIO io{c.map};bool ok=false;
  if(display13PanelTarget(controller) && display13PanelPowerReference(true)) {
   ok=c.panel.capture(io,callbackXE->firmwarePorts.panel);
-  if(ok)*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE60)=c.panel.pwm.period;
+  if(ok)*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE60)=c.panel.aux?65535:c.panel.pwm.period;
   ok=display13PanelPowerReference(false) && ok;
  }
  IOLockUnlock(c.lock);return ok;
@@ -16624,9 +16661,61 @@ void XE::display13PanelTiming(void *controller,bool apply) {
  }
  IOLockUnlock(c.lock);
 }
+// Caller holds panelLock, never c.lock over native AUX. Each operation takes
+// a fresh bound port and retains it only for this synchronous transaction.
+// Native read/writeAUX own their recursive AUX lock and nested power refs.
+bool XE::display13PanelAUX(void *controller,uint32_t brightness,unsigned action) {
+ auto s=callbackXE;auto &c=display13FBPower;if(brightness>65535 || action>2)return false;
+ IOLockLock(c.lock);Display13FBPanelIO io{c.map};
+ const auto ddi=s->firmwarePorts.panel.ddi;
+ auto port=display13PanelTarget(controller) && s->tglPortByDDI ?
+  reinterpret_cast<OSObject *(*)(uint32_t)>(s->tglPortByDDI)(ddi):nullptr;
+ const auto config=port && display13AUXReady(port,false)?Display13FBMemory::field<uint32_t *>(port,0x548):nullptr;
+ const bool bound=port && ddi<2 && config && config[0]==ddi && !config[2] &&
+  (s->adlnOutputWiring.panel&(1U<<ddi)) && display13AUXReady(port,false);
+ bool pg=false,aux=false;
+ if(bound) {
+  port->retain();pg=display13PanelPowerReference(true);
+  if(pg)aux=c.bridge.getAUX(io,ddi).status==Display13Power::Status::Complete;
+ }
+ const bool powered=io.read(0xC7200)!=UINT32_MAX && (io.read(0xC7200)&0x80000000U);
+ IOLockUnlock(c.lock);
+ struct AUX {
+  void *port;
+  bool read(uint32_t r,void *p,uint32_t n){return XE::wrapDisplay13ReadAUX(port,r,p,n)==0;}
+  bool write(uint32_t r,void *p,uint32_t n){return XE::wrapDisplay13WriteAUX(port,r,p,n)==0;}
+ } transport{port};
+ EDPAuxBacklight::Caps caps;
+ bool ok=aux && powered && EDPAuxBacklight::probe(transport,caps);
+ // Enable over AUX is independent of brightness. The native LightUpEDP
+ // asserts EDP_BLC_ENABLE (PPS +4 bit2) before this callback; PPS off clears
+ // it. That is the pin-enable backend when AUX enable is absent.
+ ok=ok && (caps.set || c.panel.pwm.valid());
+ if(ok)ok=EDPAuxBacklight::apply(transport,caps,static_cast<EDPAuxBacklight::Action>(action),brightness);
+ IOLockLock(c.lock);
+ ok=ok && display13PanelTarget(controller) && display13AUXReady(port,false);
+ if(ok && !caps.set) {
+  uint32_t duty=0;ok=c.panel.pwm.duty(brightness,duty);
+  if(ok && action!=2){io.write(0xC8258,duty);ok=io.read(0xC8258)==duty;}
+  if(ok && action!=0) {
+   const auto value=action==1?0x80000000U|c.panel.pwm.polarity:0;
+   io.write(0xC8250,value);ok=io.read(0xC8250)==value;
+  }
+ }
+ if(ok && action!=2)c.panel.brightness=brightness;
+ if(aux)ok=(c.bridge.putAUX(io,ddi).status==Display13Power::Status::Complete) && ok;
+ if(pg)ok=display13PanelPowerReference(false) && ok;
+ IOLockUnlock(c.lock);if(bound)port->release();return ok;
+}
 uint32_t XE::display13PanelBrightness(void *controller,uint32_t brightness) {
  if(!display13PanelCapture(controller))return kIOReturnNotReady;
- auto &c=display13FBPower;IOLockLock(c.lock);Display13FBPanelIO io{c.map};bool ok=false;uint32_t duty=0;
+ auto &c=display13FBPower;
+ if(c.panel.aux) {
+  IOLockLock(c.panelLock);const bool ok=display13PanelAUX(controller,brightness,0);
+  if(ok)*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
+  IOLockUnlock(c.panelLock);return ok?0:kIOReturnNotReady;
+ }
+ IOLockLock(c.lock);Display13FBPanelIO io{c.map};bool ok=false;uint32_t duty=0;
  if(display13PanelTarget(controller) && c.panel.pwm.duty(brightness,duty) &&
     display13PanelPowerReference(true)) {
   io.write(0xC8258,duty);ok=io.read(0xC8258)==duty;
@@ -16635,8 +16724,26 @@ uint32_t XE::display13PanelBrightness(void *controller,uint32_t brightness) {
  }
  IOLockUnlock(c.lock);return ok?0:kIOReturnNotReady;
 }
-void XE::display13PanelPWMEnable(void *access) {
+// Replace the native period write too: an AUX-only panel has no PWM period.
+void XE::display13PanelPWMPeriod(void *access) {
  auto &c=display13FBPower;if(!c.lock)return;IOLockLock(c.lock);Display13FBPanelIO io{c.map};
+ if(access==c.access && display13PanelTarget(c.controller)) {
+  if(c.panel.pwm.valid() && display13PanelPowerReference(true)) {
+   io.write(0xC8254,c.panel.pwm.period);const bool ok=io.read(0xC8254)==c.panel.pwm.period;
+   if(!display13PanelPowerReference(false) || !ok)c.panelFaulted=true;
+  } else if(!c.panel.aux)c.panelFaulted=true;
+ }
+ IOLockUnlock(c.lock);
+}
+void XE::display13PanelPWMEnable(void *access) {
+ auto &c=display13FBPower;if(!c.lock)return;
+ if(c.panel.aux) {
+  IOLockLock(c.panelLock);
+  const bool ok=access==c.access && display13PanelAUX(c.controller,c.panel.brightness,1);
+  if(!ok){IOLockLock(c.lock);c.panelFaulted=true;IOLockUnlock(c.lock);}
+  IOLockUnlock(c.panelLock);return;
+ }
+ IOLockLock(c.lock);Display13FBPanelIO io{c.map};
  if(access==c.access && display13PanelTarget(c.controller) && c.panel.pwm.valid() &&
     display13PanelPowerReference(true)) {
   const auto value=0x80000000U|c.panel.pwm.polarity;
@@ -16649,7 +16756,16 @@ uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
  auto s=callbackXE;auto &c=display13FBPower;
  if(!s->adlnOutputWiring.panel)return FunctionCast(wrapDisplay13PanelPower,s->orgDisplay13PanelPower)(controller,state);
  if(!c.panelLock || !c.lock || !display13PanelCapture(controller))return kIOReturnNotReady;
- IOLockLock(c.panelLock);IOLockLock(c.lock);Display13FBPanelIO io{c.map};Display13Panel::OnGate gate;
+ IOLockLock(c.panelLock);
+ // Disable AUX brightness while the panel still answers AUX, before PPS off.
+ // Repeated off after a successful power-down needs no sink transaction.
+ if(c.panel.aux && state!=2) {
+  IOLockLock(c.lock);Display13FBPanelIO check{c.map};const auto status=check.read(0xC7200);IOLockUnlock(c.lock);
+  if(status==UINT32_MAX || ((status&0x80000000U) && !display13PanelAUX(controller,c.panel.brightness,2))) {
+   IOLockUnlock(c.panelLock);return kIOReturnNotReady;
+  }
+ }
+ IOLockLock(c.lock);Display13FBPanelIO io{c.map};Display13Panel::OnGate gate;
  const bool owned=display13PanelTarget(controller) && display13PanelPowerReference(true);
  const bool ready=owned && (state!=2 || gate.begin(io));
  IOLockUnlock(c.lock);
@@ -17016,8 +17132,10 @@ bool XE::adlsPanelPWMTarget(void *controller,void *&access,void *&power) {
     !XELP::PanelPower::nativePPS0(s->firmwarePorts,s->xeProfile.family) || c[0x918] ||
     *reinterpret_cast<void **>(c+0xD0) || *reinterpret_cast<void **>(c+0xD40)!=s->tglPlatformCopy ||
     !s->orgTGLRegisterRead || !s->orgTGLRegisterWrite)return false;
+ // Native resetSoftwareState starts at mode0. The bound panel record and
+ // access owner already identify PPS/PWM before LightUpEDP sets mode1.
  auto port=static_cast<uint8_t *>(s->tglTCNativeFunctions.portByDDI(0));
- if(!port || port[0x117] || *reinterpret_cast<uint32_t *>(port+0x550)!=1 || !s->adlsWiring.boundPanel(s->tglPlatformCopy,*reinterpret_cast<uint32_t **>(port+0x548)))return false;
+ if(!port || port[0x117] || *reinterpret_cast<uint32_t *>(port+0x550)>1 || !s->adlsWiring.boundPanel(s->tglPlatformCopy,*reinterpret_cast<uint32_t **>(port+0x548)))return false;
  auto a=*reinterpret_cast<uint8_t **>(c+0xC40);auto p=*reinterpret_cast<uint8_t **>(c+0xC8);
  if(!a || !p || *reinterpret_cast<void **>(p+0x10)!=controller || p[0x18] ||
     *reinterpret_cast<void **>(p+0x78)!=a || *reinterpret_cast<void **>(port+0x578)!=a ||

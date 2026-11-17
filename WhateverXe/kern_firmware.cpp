@@ -8,18 +8,18 @@ static void publishBytes(IOPCIDevice *pci,const char *key,const void *bytes,unsi
     if(data){pci->setProperty(key,data);data->release();}
 }
 
-// Own the optional registry object while copying its fixed-size bytes. No
-// borrowed OSData storage survives release; parsing consumes only this stack copy.
-static XELP::VBT::Ports firmwarePortsWithPanelHint(IOPCIDevice *pci,const void *bytes,
-                                                 size_t length,XELP::Family family) {
-    uint8_t edid[128] {};size_t count=0;
+// Explicit panel EDID hint (device property xelp-panel-edid, 128 bytes) for a VBT
+// whose panel type is the 255 sentinel and whose OpRegion carries no usable EDID.
+// Copied into the caller's buffer before release; it only selects which VBT
+// panel profile describes this panel, exactly like the OpRegion EDID, and wins
+// over it when present. Returns the identity to pass to VBT::parse.
+static const uint8_t *firmwarePanelHint(IOPCIDevice *pci,uint8_t (&edid)[128],const uint8_t *opregion) {
     auto object=pci->copyProperty("xelp-panel-edid");
     auto data=OSDynamicCast(OSData,object);
-    if(data && data->getLength()==sizeof(edid)) {
-        memcpy(edid,data->getBytesNoCopy(),sizeof(edid));count=sizeof(edid);
-    }
+    const bool hinted=data && data->getLength()==sizeof(edid);
+    if(hinted)memcpy(edid,data->getBytesNoCopy(),sizeof(edid));
     if(object)object->release();
-    return XELP::VBT::parse(bytes,length,family,count?edid:nullptr,count);
+    return hinted ? edid : opregion;
 }
 
 // Firmware is read once, before topology/hook selection. No PCI BAR/ROM scan,
@@ -49,19 +49,21 @@ void XE::captureFirmware(IOPCIDevice *pci,const XELP::Profile &profile) {
                 // Preserve existing diagnostics for collectors.
                 pci->setProperty("TGLASLS",asls,32);
                 publishBytes(pci,"TGLOpRegion",bytes,8192);
+                uint8_t hint[128] {};
+                const auto identity=firmwarePanelHint(pci,hint,XELP::VBT::panelEDID(bytes,8192));
                 if(region.address) {
                     auto vbtMemory=IOMemoryDescriptor::withPhysicalAddress(region.address,region.bytes,kIODirectionIn);
                     auto vbtMap=vbtMemory ? vbtMemory->map(kIOMapReadOnly) : nullptr;
                     if(vbtMap && vbtMap->getVirtualAddress() && vbtMap->getLength()>=region.bytes) {
                         const auto data=reinterpret_cast<const void *>(vbtMap->getVirtualAddress());
-                        firmwarePorts=firmwarePortsWithPanelHint(pci,data,region.bytes,profile.family);
+                        firmwarePorts=XELP::VBT::parse(data,region.bytes,profile.family,identity);
                         if(firmwarePorts.valid()){source=2;publishBytes(pci,"TGLVBT",data,firmwarePorts.bytes);}
                     }
                     if(vbtMap)vbtMap->release();
                     if(vbtMemory)vbtMemory->release();
                 }
                 if(!firmwarePorts.valid()) {
-                    const auto embedded=firmwarePortsWithPanelHint(pci,bytes+0x400,region.inlineBytes,profile.family);
+                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,profile.family,identity);
                     if(embedded.valid()) {
                         firmwarePorts=embedded;source=1;
                         publishBytes(pci,"TGLVBT",bytes+0x400,firmwarePorts.bytes);
@@ -79,7 +81,9 @@ void XE::captureFirmware(IOPCIDevice *pci,const XELP::Profile &profile) {
     pci->setProperty("WhateverXeFirmwarePorts",summary,sizeof(summary));
     pci->setProperty("WhateverXeFirmwareChecksum",firmwarePorts.checksum,32);
     pci->setProperty("WhateverXeFirmwarePortRecords",firmwarePorts.port,sizeof(firmwarePorts.port));
-    uint32_t identity[]={1,static_cast<uint32_t>(firmwarePorts.panelIdentity.status),firmwarePorts.panelIdentity.index};
+    // Schema 2: the panel profile VBT::parse selected (valid, type); since 0.8.3 the
+    // identity match is upstream's, fed by xelp-panel-edid or the OpRegion EDID.
+    uint32_t identity[]={2,firmwarePorts.panel.valid,firmwarePorts.panel.valid ? firmwarePorts.panel.type : UINT32_MAX};
     pci->setProperty("WhateverXeFirmwarePanelIdentity",identity,sizeof(identity));
     const auto &panel=firmwarePorts.panel;
     uint32_t panelFacts[]={panel.valid,panel.type,panel.ddi,panel.lowSwing,panel.hobl};

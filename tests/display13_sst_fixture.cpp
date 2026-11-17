@@ -35,7 +35,7 @@ struct Context {
  Display13Power::NativeBridge bridge;void *lock=reinterpret_cast<void *>(1),*controller=nullptr,*access=nullptr;
  Display13Power::MainLinkAUX mainLink[2];alignas(void *) uint8_t powerBytes[0x80]{};void *power=powerBytes;
  Map *map=nullptr;bool panelFaulted=false,clockFaulted=false,memoryFaulted=false,clockStopped=false;
- struct {void *memoryFramebuffer=nullptr;} pipe[3];
+ struct {IOService *memoryFramebuffer=nullptr;Display13FBMemory::Readout memory;} pipe[3];
 }display13FBPower;
 struct Display13FBPowerIO {
  Map *map;bool tcAuxSupported(){return true;}bool prepareTCAux(unsigned tc){return tc<4;}bool tcAuxHealthy(unsigned tc){return tc<4;}
@@ -187,40 +187,15 @@ int main(int argc,char **argv){
   assert(!XE::wrapDisplay13EnablePort(f.port));assert(!XE::wrapDisplay13DisablePort(f.port));assert(objectRefs.empty());
   display13FBPower.panelFaulted=true;assert(!XE::display13SSTPort(f.port));
  }
- // Actual startup can leave eDP A mode0 with a protected pending AUX lease.
- // This does not admit unowned zero-mode ports or mutate the software mode.
- for(unsigned stage=0;stage<2;++stage)for(unsigned fault=0;fault<14;++fault) {
-  Fixture f(0,0,0);Map map;setup(f,map,0,0,4,20,true);auto &c=display13FBPower;
-  state.firmwarePorts.panel.valid=true;state.firmwarePorts.panel.ddi=0;
-  c.bridge.bootPort=0;c.bridge.bootAdopted=stage;c.bridge.bootPath=stage?99:0;
-  c.bridge.bootPGProtected=c.bridge.bootDDIProtected=!stage;
-  auto &link=c.mainLink[0];Display13FBPowerIO power{&map};
-  assert(Display13Power::acquire(power,c.bridge.state,link.lease,Display13Power::auxDomain(0)).status==Display13Power::Status::Complete);
-  link.port=0;link.bootPending=!stage;link.owner=stage?reinterpret_cast<uintptr_t>(f.port):0;
-  put(f.port,0x550,0U);map.reads.clear();map.writes.clear();
-  if(fault==1)state.firmwarePorts.panel.valid=false;
-  if(fault==2)state.firmwarePorts.panel.ddi=1;
-  if(fault==3)c.bridge.bootPort=1;
-  if(fault==4)link.lease.owner=nullptr;
-  if(fault==5)link.lease.domains=1;
-  if(fault==6)link.port=1;
-  if(fault==7)link.owner=123;
-  if(fault==8)link.bootPending=stage;
-  if(fault==9)c.bridge.state.suspended=true;
-  if(fault==10)c.bridge.state.faulted=true;
-  if(fault==11)c.bridge.state.refs[8]=0;
-  if(fault==12)state.adlnOutputWiring.panel=0;
-  if(fault==13){if(stage)c.bridge.bootPath=0;else c.bridge.bootPGProtected=false;}
-  assert(bool(XE::display13SSTPort(f.port))==!fault);
-  assert(Display13FBMemory::field<uint32_t>(f.port,0x550)==0 && map.reads.empty() && map.writes.empty());
- }
+ // (0.8.3: display13SSTPort accepts Combo mode 0/1 upstream; the protected
+ // boot-AUX-lease-only variant and its fault matrix were retired in the merge.)
  // Firmware handoff: a Combo eDP port still in native mode 0 passes only as the VBT panel. Mode 1, Type-C modes, an
  // external DP or HDMI route on the same DDI, and every other term of the exact check stay as they were.
  unsigned panelBootCases=0;
  for(unsigned ddi=0;ddi<2;++ddi) {
   Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20,true);
   assert(XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));
-  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&XE::display13PanelBootPort(f.port)==f.port);++panelBootCases;
+  put(f.port,0x550,0U);assert(XE::display13PanelBootPort(f.port)==f.port);++panelBootCases; // 0.8.3: SSTPort also admits Combo mode 0
   for(unsigned mode:{2U,3U,4U}){put(f.port,0x550,mode);assert(!XE::display13PanelBootPort(f.port));++panelBootCases;}
   put(f.port,0x550,0U);assert(XE::display13PanelBootPort(f.port));
   auto &c=display13FBPower;
@@ -236,35 +211,35 @@ int main(int argc,char **argv){
   for(uint32_t id:{0xA7218086U,0xA7A18086U,0xA7A98086U,0xA7AC8086U,0xA7AD8086U}){state.xeProfile.identity=id;assert(!XE::display13PanelBootPort(f.port));++panelBootCases;}
   for(uint32_t id:{0xA7208086U,0xA7A08086U,0xA7A88086U,0xA7AA8086U,0xA7AB8086U,0x46A68086U,0x46D08086U}){state.xeProfile.identity=id;assert(XE::display13PanelBootPort(f.port));++panelBootCases;}
   state.xeProfile.identity=0;
-  // No other SST caller is loosened: with mode 0 they still refuse, once the native mode is set they run as before.
+  // 0.8.3 loosens every SST caller to Combo mode 0/1 (display13SSTPort); the
+  // mode-0 refusal of the other callers no longer applies.
   assert(XE::display13PanelBootPort(f.port));
-  assert(XE::wrapDisplay13EnablePort(f.port)==kIOReturnNotReady&&!linkCalls);
   put(f.port,0x550,1U);assert(!XE::display13PanelBootPort(f.port)&&XE::display13SSTPort(f.port));
   assert(!XE::wrapDisplay13EnablePort(f.port));assert(!XE::wrapDisplay13DisablePort(f.port));assert(objectRefs.empty());
  }
  for(unsigned ddi=0;ddi<2;++ddi) {
   Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20);
-  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
+  put(f.port,0x550,0U);assert(!XE::display13PanelBootPort(f.port));++panelBootCases;
   assert(objectRefs.empty());
  }
  {
   // A Type-C DP route is not a Combo handoff.
   Fixture f(0,0,3);Map map;setup(f,map,3,0,4,20);
-  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
+  put(f.port,0x550,0U);assert(!XE::display13PanelBootPort(f.port));++panelBootCases;
   assert(objectRefs.empty());
  }
  for(unsigned ddi=0;ddi<2;++ddi) {
   // The clock path: a VBT panel next to another output, booted on the panel, its pipe alone. Raptor Lake-U stays out.
   Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20,true);auto &c=display13FBPower;
   assert(!XE::display13PanelOnlyClock());++panelBootCases;
-  c.bridge.bootPort=ddi;c.pipe[0].memoryFramebuffer=f.fb;
+  c.bridge.bootPort=ddi;c.pipe[0].memoryFramebuffer=reinterpret_cast<IOService *>(f.fb);
   for(uint32_t id:{0xA7A08086U,0xA7A88086U,0x46A68086U}){state.xeProfile.identity=id;assert(XE::display13PanelOnlyClock());++panelBootCases;}
   for(uint32_t id:{0xA7218086U,0xA7A18086U,0xA7A98086U,0xA7AC8086U,0xA7AD8086U}){state.xeProfile.identity=id;assert(!XE::display13PanelOnlyClock());++panelBootCases;}
   state.xeProfile.identity=0xA7A08086U;
-  c.pipe[1].memoryFramebuffer=f.fb;assert(!XE::display13PanelOnlyClock());c.pipe[1].memoryFramebuffer=nullptr;++panelBootCases;
+  c.pipe[1].memoryFramebuffer=reinterpret_cast<IOService *>(f.fb);assert(!XE::display13PanelOnlyClock());c.pipe[1].memoryFramebuffer=nullptr;++panelBootCases;
   c.bridge.bootPort=1-ddi;assert(!XE::display13PanelOnlyClock());c.bridge.bootPort=ddi;++panelBootCases;
   assert(XE::display13PanelOnlyClock()&&!locked);
-  Fixture g(0,0,ddi);Map other;setup(g,other,ddi,0,4,20);display13FBPower.bridge.bootPort=ddi;display13FBPower.pipe[0].memoryFramebuffer=g.fb;
+  Fixture g(0,0,ddi);Map other;setup(g,other,ddi,0,4,20);display13FBPower.bridge.bootPort=ddi;display13FBPower.pipe[0].memoryFramebuffer=reinterpret_cast<IOService *>(g.fb);
   assert(!XE::display13PanelOnlyClock());++panelBootCases;
  }
  printf("PASS Display13 eDP boot handoff: %u mode 0 admission and clock path cases, only the VBT panel on Combo A/B\n",panelBootCases);

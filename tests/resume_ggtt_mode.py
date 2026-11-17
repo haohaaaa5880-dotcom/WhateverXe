@@ -10,10 +10,11 @@ fn=s[s.index('bool XE::restoreDisplay13ResourcesLocked'):]
 fn=fn[:fn.index('\nbool XE::',1) if '\nbool XE::' in fn[1:] else len(fn)]
 park=fn.index('Display13ResumePark::park(parkIO')
 stopped=fn.index('if(!Display13FBIRQ::consumersStopped(io,7,c.transcoders))result.status')
-mbus=fn.index('if(cold[5]!=c.dbuf.mbus)result.status=Display13Power::Status::NotReady')
-ggtt=fn.index('Display13ResumePark::restoreGGTTMode(')
-assert park < stopped < mbus < ggtt, 'GGTT restore must follow the park and the consumers-stopped check'
-assert fn.count('restoreGGTTMode(')==1 and 'cold[12]=before;cold[13]=after;' in fn and 'cold[14]' in fn
+# Since 0.8.3 the restore is upstream's Display13Power::restoreGGTT: a failed
+# readback keeps the restore pending (display13_shared_restore covers that).
+mbus=fn.index('if(cold[5]!=c.dbuf.mbus || !Display13Power::restoreGGTT(')
+assert park < stopped < mbus, 'GGTT restore must follow the park and the consumers-stopped check'
+assert fn.count('restoreGGTT(')==1 and 'cold[14]' in fn
 io=s[s.index('struct Display13FBResumeParkIO'):s.index('struct Display13FBTCIO')]
 assert 'bool write(uint32_t r,uint32_t v)' in io and 'return false;' in io and '0x42084' not in io
 assert 'Denied' in h and 'if(!io.write(reg,value)) {r.status=Status::Denied' in h

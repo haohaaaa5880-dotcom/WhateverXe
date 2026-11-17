@@ -536,8 +536,10 @@ private:
  static bool display13PanelPowerReference(bool acquire);
  static bool display13PanelCapture(void *controller);
  static void display13PanelTiming(void *controller,bool apply);
+ static bool display13PanelAUX(void *controller,uint32_t brightness,unsigned action);
  static uint32_t display13PanelBrightness(void *controller,uint32_t brightness);
  static void display13PanelPWMEnable(void *access);
+ static void display13PanelPWMPeriod(void *access);
  static uint32_t wrapDisplay13PanelPower(void *controller,uint32_t state);
  // -wex-edp-blank: display sleep of the kept panel link without the donor's power
  // transition (kern_display13_edp_blank), run instead of the power callback.

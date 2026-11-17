@@ -283,16 +283,22 @@ template<class IO> Status restoreAfterPowerLoss(IO &io,State &s,uint32_t allowed
     s.enabled=false;s.active=0;
     return enable(io,s,s.excludedPCH,NativeGT,actual.active,s.ports,s.typeC);
 }
-// Native enableIRQ after a display off/on or a power loss can run before any
-// pipe's transcoder is enabled again (eDP-A display wake, hibernation resume).
-// enable() would then fail permanently (Topology/Power -> faulted) and
-// restoreAfterPowerLoss() refuses. Report that case so the caller defers the
-// (re)arm to the pipe's native VBL enable instead. DSI is excluded: its
-// power-off state is a hard refusal, and its wake already finds the pipe running.
-template<class IO> bool deferRearm(IO &io,const State &s) {
-    if(!s.begun || s.faulted || s.transcoders.dsi0Pipe<3)return false;
-    const auto r=readActivePipes(io,7,s.transcoders);
-    return r.status==Status::Topology && !r.active;
+// A previously installed IRQ owner may be resumed before its pipe. Keep this
+// temporary absence distinct from enable()'s permanent topology/IRQ failures.
+// Reference: jkbuha/WhateverXe cf51935, resume rearm; native enablePipe arms VBL
+// after PIPECONF. The caller holds the IRQ lock and retries at that boundary.
+template<class IO> bool deferRearm(IO &io,const State &s,uint32_t admitted) {
+    if(!s.begun || s.faulted || !admitted || (admitted&~7U) || !s.transcoders.valid())return false;
+    const auto wells=io.read(Driver);
+    if(wells==UINT32_MAX || (wells&3)!=3)return false;
+    // Admission is a set of possible consumers, not a promise that every
+    // peer power well is currently on. Never read an unpowered bank.
+    for(unsigned p=0;p<3;++p)if(powered(wells,p)) {
+        const auto conf=Display13Transcoder::control(io,p,s.transcoders);
+        if(conf==UINT32_MAX || (conf&0xC0000000U))return false;
+    }
+    const auto actual=readActivePipes(io,admitted,s.transcoders);
+    return actual.status==Status::Topology && !actual.active;
 }
 template<class IO> Status disable(IO &io,State &s) {
     if(!s.begun || !io.readable(Master))return Status::Unavailable;

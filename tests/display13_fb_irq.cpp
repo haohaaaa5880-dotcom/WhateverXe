@@ -23,6 +23,8 @@ struct IO {
             for(unsigned dsb=0;dsb<3;++dsb) {r[DSBInterrupt(p,dsb)]=0;r[DSBInterrupt(p,dsb)-0x20]=0;}
         }
         for(auto iir:{0x44448U,0x44468U,0x44478U,0x44488U}) {r[iir]=r[iir+4]=0;r[iir-4]=~0U;}
+        // deferRearm (0.8.3) reads every powered pipe's transcoder control.
+        for(unsigned p=1;p<3;++p)if(!r.count(0x70008+p*0x1000))r[0x70008+p*0x1000]=0;
     }
     bool readable(uint32_t reg) {return reg<0x1000000;}
     void check(uint32_t reg) {
@@ -53,21 +55,21 @@ int main() {
     // deferRearm() reports the case, and enable() succeeds once the pipe runs.
     {IO io;State s;
      assert(enable(io,s,0,NativeGT,1,3,0)==Status::Complete && s.enabled && s.active==1);
-     assert(!deferRearm(io,s));                                   // pipe A running: no deferral
+     assert(!deferRearm(io,s,1));                                   // pipe A running: no deferral
      assert(disable(io,s)==Status::Complete && !s.enabled);
      io.r[0x70008]=0;                                             // display off: transcoder stopped
-     assert(deferRearm(io,s));
+     assert(deferRearm(io,s,1));
      {IO probe=io;State t=s;assert(enable(probe,t,0,NativeGT,1,3,0)==Status::Topology && t.faulted);} // the old fault
-     io.wells=0xFC03;assert(deferRearm(io,s));                    // pipe well also down
+     io.wells=0xFC03;assert(deferRearm(io,s,1));                    // pipe well also down
      io.wells=0xFC0F;io.r[0x70008]=0xC0000000;                     // VBL enable: pipe running again
-     assert(!deferRearm(io,s) && enable(io,s,0,NativeGT,1,3,0)==Status::Complete && s.enabled && !s.faulted);
+     assert(!deferRearm(io,s,1) && enable(io,s,0,NativeGT,1,3,0)==Status::Complete && s.enabled && !s.faulted);
      // Power loss: restore refuses without faulting while nothing runs, then completes.
-     io.r[0x70008]=0;assert(restoreAfterPowerLoss(io,s,1)==Status::Topology && !s.faulted && deferRearm(io,s));
+     io.r[0x70008]=0;assert(restoreAfterPowerLoss(io,s,1)==Status::Topology && !s.faulted && deferRearm(io,s,1));
      io.r[0x70008]=0xC0000000;assert(restoreAfterPowerLoss(io,s,1)==Status::Complete && s.enabled);
-     // Never before the first enable, never after a fault, never for DSI.
-     State fresh;assert(!deferRearm(io,fresh));
-     State faulted=s;faulted.faulted=true;io.r[0x70008]=0;assert(!deferRearm(io,faulted));
-     State dsi=s;dsi.transcoders.dsi0Pipe=0;assert(!deferRearm(io,dsi));}
+     // Never before the first enable, never after a fault. (DSI policy is
+     // upstream's since 0.8.3: deferRearm checks its transcoder like any other.)
+     State fresh;assert(!deferRearm(io,fresh,1));
+     State faulted=s;faulted.faulted=true;io.r[0x70008]=0;assert(!deferRearm(io,faulted,1));}
     // Cold wake erased both peer IRQ banks and HPD programming. Restore only
     // actually restarted pipes, while re-enabling both selected connectors.
     {IO io;State s;s.transcoders.dsi0Pipe=0;

@@ -85,6 +85,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - `-wex-tgl-hwenc`: Tiger Lakeのハードウェア動画エンコード（VideoToolboxのH.264）を許可します。既定では無効です。[既知の問題](#既知の問題と制限)を参照してください。
 - `-wex-tgl-posh`: Tiger LakeのMetalグラフィックスで、position-only shading（POSH）と対になるコンテキストを維持します。レンダーエンジンが停止するため、既定では無効にしています。
 - `-wex-tgl-no-poshfix`: ネイティブのリセットがゴールデンイメージを再読み込みした後、Tiger LakeのレンダーコンテキストのPOSHフィールド（CTX_CTRLのビット4、POSH_LRCA）を修復しません。
+- `-wex-tgl-no-hangwake`: ネイティブのハングレポートがエンジン種別1で取得せずに解放するGT forcewakeを補正しません。補正しないと、GPUハングから復旧するたびにGPUが起きたままになり、再起動までRC6に入りません（動作が重く消費電力が高い状態）。
 
 ### その他の設定
 

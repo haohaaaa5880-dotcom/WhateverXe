@@ -122,6 +122,7 @@
   ],
   "-wex-tgl-hwenc": [],
   "-wex-tgl-no-poshfix": [],
+  "-wex-tgl-no-hangwake": [],
   "-wex-tgl-posh": [],
   "-wex-tgl-prog-off": [
     "-tglprogoff"

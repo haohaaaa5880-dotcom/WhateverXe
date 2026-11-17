@@ -141,6 +141,7 @@
   ],
   "-wex-tgl-hwenc": [],
   "-wex-tgl-no-gtfreq": [],
+  "-wex-tgl-no-hangwake": [],
   "-wex-tgl-no-orphanstamp": [],
   "-wex-tgl-no-poshfix": [],
   "-wex-tgl-posh": [],

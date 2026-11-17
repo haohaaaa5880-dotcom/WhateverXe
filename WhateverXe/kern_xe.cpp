@@ -351,6 +351,22 @@ constexpr unsigned tglHangWords=74, tglHangRecords=8;
 // A024, RC_STATE A094; q73 ready. Units: 16.67 MHz (Gen9+ frequency ratio).
 constexpr uint32_t tglHangFreqRegs[4] {0xA008,0x1381B4,0xA024,0xA094};
 uint64_t *tglHangLastRecord {};
+// RC6 forensics (read-only): GT power-management registers per Linux v6.12
+// intel_rc6.c gen11_rc6_enable, sampled before (tglHangCapture) and after
+// (tglHangFinish) each reset, and live via TGLRC6Live. Question: does the
+// render-domain reset leave RC6 disabled (GPU 100% active after recovery)?
+// RC_CONTROL A090, RC_STATE A094, RC6_WAKE_RATE_LIMIT A09C, RC_EVALUATION_INTERVAL
+// A0A8, RC_IDLE_HYSTERSIS A0AC, RC_SLEEP A0B0, RC6_THRESHOLD A0B8, MEDIA_PG_IDLE
+// A0C4, RENDER_PG_IDLE A0C8, PG_ENABLE A210, RC6_CTX_INFO 8504, RC6 residency
+// 138108 (1.28 us ticks), RPSTAT1 1381B4, FORCEWAKE_ACK_GT 130044, FORCEWAKE_GT
+// A188, RCS RING_MAX_IDLE 2054.
+constexpr uint32_t tglRC6Regs[16] {0xA090,0xA094,0xA09C,0xA0A8,0xA0AC,0xA0B0,0xA0B8,0xA0C4,
+	0xA0C8,0xA210,0x8504,0x138108,0x1381B4,0x130044,0xA188,0x2054};
+uint32_t tglHangRC6[8][2][16] {};
+uint32_t tglHangLastIndex {};
+inline void tglRC6Sample(volatile uint8_t *bar,uint32_t *out) {
+	for (unsigned i=0;i<16;++i) out[i]=*reinterpret_cast<volatile uint32_t *>(bar+tglRC6Regs[i]);
+}
 constexpr uint32_t tglHangRegs[18] {0x2030,0x2034,0x2038,0x203C,0x2064,0x2068,0x206C,0x2074,
 	0x2110,0x2140,0x2168,0x2244,0x209C,0x2234,0x2238,0x23A0,0x2050,0x44050};
 uint64_t tglHangRecord[tglHangRecords][tglHangWords] {};
@@ -367,6 +383,7 @@ void tglHangCapture(void *channel) {
 		for (unsigned i=0;i<18;i+=2) q[2+i/2]=rd(tglHangRegs[i])|static_cast<uint64_t>(rd(tglHangRegs[i+1]))<<32;
 		head=static_cast<uint32_t>(q[2]>>32);ok|=1;
 		for (unsigned i=0;i<4;++i) q[69+i]=rd(tglHangFreqRegs[i]);
+		tglRC6Sample(bar,tglHangRC6[n%tglHangRecords][0]);
 	}
 	void *ring=TGLRecovery::field<void *>(channel,0x130);
 	void *ctx=ring ? TGLRecovery::field<void *>(ring,0x20) : nullptr;
@@ -388,6 +405,7 @@ void tglHangCapture(void *channel) {
 		ok|=4;
 	}
 	q[67]=ok|static_cast<uint64_t>(n+1)<<8|static_cast<uint64_t>(mask)<<32;
+	tglHangLastIndex=n%tglHangRecords;
 	tglHangLastRecord=q;
 }
 // After the native reset and replay: post-reset frequency samples, then publish.
@@ -397,6 +415,7 @@ void tglHangFinish(void *channel) {
 	auto bar=accel ? TGLRecovery::field<volatile uint8_t *>(accel,0x1240) : nullptr;
 	if (bar) for (unsigned i=0;i<4;++i)
 		q[69+i]|=static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(bar+tglHangFreqRegs[i]))<<32;
+	if (bar) tglRC6Sample(bar,tglHangRC6[tglHangLastIndex][1]);
 	__atomic_store_n(&q[73],1,__ATOMIC_RELEASE);
 }
 bool tglHangSerialize(void *,void *,OSSerialize *serializer) {
@@ -14052,6 +14071,64 @@ bool tglGTFreqSerialize(void *,void *,OSSerialize *serializer) {
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 }
+// Hang-report forcewake balance. IntelAccelerator::gatherKeyRingData(IGHwCsType)
+// (donor 0x2DBAC) takes a per-engine forcewake, gathers registers, then releases
+// "ebx" at its common exit (0x2E42D: SafeForceWake(false,ebx)). ebx defaults to 4
+// (GT, A188) and every case sets and acquires its own mask, except engine type 1:
+// its jump-table entry (0x2E448[1]) lands on the exit (0x2E3D1) without acquiring.
+// encodeDebugInfo and doHangAnalysis gather every engine, so each GPU hang releases
+// the GT forcewake twice without a get. The GT count goes negative (-2 per hang,
+// measured with the forcewake probe), SafeForceWake never sees 1 -> 0 again, the
+// GT request stays asserted and RC6 residency drops to 0% until reboot (GPU Active
+// 100%, sluggish desktop after any recovered hang, 9320 and 9720). Take the GT
+// wake the donor will release for type 1. Opt-out: -wex-tgl-no-hangwake.
+namespace {
+uintptr_t tglHangWakeOriginal {};
+using TGLSafeForceWake=void (*)(void *,bool,uint32_t);
+TGLSafeForceWake tglHangWakeGet {};
+uint32_t tglHangWakeCounts[2] {}; // calls, type-1 balanced
+bool tglHangWakeGather(void *accel,uint32_t type) {
+ __atomic_fetch_add(&tglHangWakeCounts[0],1,__ATOMIC_RELAXED);
+ if (type==1 && accel && tglHangWakeGet) {
+  tglHangWakeGet(accel,true,4);
+  __atomic_fetch_add(&tglHangWakeCounts[1],1,__ATOMIC_RELAXED);
+ }
+ return FunctionCast(tglHangWakeGather,tglHangWakeOriginal)(accel,type);
+}
+bool tglHangWakeSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[3] {1,__atomic_load_n(&tglHangWakeCounts[0],__ATOMIC_RELAXED),__atomic_load_n(&tglHangWakeCounts[1],__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+}
+static void tglInstallHangWakeBalance(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-no-hangwake")) { root->setProperty("TGLHangWakeBalanceReady",false);return; }
+ const char *symbol="__ZN16IntelAccelerator17gatherKeyRingDataE10IGHwCsType";
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ const auto wake=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size);patcher.clearError();
+ // mov ebx,4 ; lea rcx,[rip+0x848] (jump table 0x2E448)
+ static const uint8_t mask[] {0xBB,0x04,0x00,0x00,0x00,0x48,0x8D,0x0D,0x48,0x08,0x00,0x00};
+ // exit: mov rdi,r12 ; xor esi,esi ; mov edx,ebx ; call SafeForceWake
+ static const uint8_t exit[] {0x4C,0x89,0xE7,0x31,0xF6,0x89,0xDA,0xE8};
+ bool ready=size>0x2E460 && fn==address+0x2DBAC && wake==address+0x28C2A &&
+  !memcmp(reinterpret_cast<void *>(address+0x2DBF4),mask,sizeof(mask)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x2E42A),exit,sizeof(exit));
+ if (ready) {
+  int32_t entry1;memcpy(&entry1,reinterpret_cast<void *>(address+0x2E448+4),sizeof(entry1));
+  ready=entry1==static_cast<int32_t>(0x2E3D1-0x2E448);
+ }
+ if (ready) {
+  tglHangWakeGet=reinterpret_cast<TGLSafeForceWake>(wake);
+  KernelPatcher::RouteRequest route(symbol,tglHangWakeGather,tglHangWakeOriginal);
+  ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+  if (!ready) tglHangWakeGet=nullptr;
+ }
+ root->setProperty("TGLHangWakeBalanceReady",ready);
+ if (ready) if (auto live=OSSerializer::forTarget(nullptr,tglHangWakeSerialize)) {
+  root->setProperty("TGLHangWakeBalanceLive",live);live->release();
+ }
+}
 static void tglInstallGTFreqFloor(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  auto root=IORegistryEntry::getRegistryRoot();
  if (checkKernelArgument("-wex-tgl-no-gtfreq")) { root->setProperty("TGLGTFreqFloorReady",false);return; }
@@ -14288,6 +14365,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  tglEncodeGuardReady=tglInstallEncodeGuard(patcher,index,address,size);
  tglInstallContextOwners(patcher,index,address,size);
  tglInstallGTFreqFloor(patcher,index,address,size);
+ tglInstallHangWakeBalance(patcher,index,address,size);
  tglInstallOrphanStamp(patcher,index,address,size);
  // The Alder Lake / Raptor Lake RCS profile (adlnPrepareRCSProfile) owns the
  // queue-context parameters at 0xB0BC0 and validates their native bytes; there
@@ -18361,7 +18439,8 @@ void tglCSBRestoreHWS(void *streamer) {
 // masked registers as value|0xFFFF0000, as the native restore list does.
 struct TGLDomainRegister { uint32_t reg; bool masked; };
 constexpr TGLDomainRegister tglDomainRegisters[] {
- {0x2050,true},{0x1A050,true},{0x20B4,false},{0x1A0A8,false},{0x1A058,false},{0x1A4D4,false},{0x1A0D4,true}
+ {0x2050,true},{0x1A050,true},{0x20B4,false},{0x1A0A8,false},{0x1A058,false},{0x1A4D4,false},{0x1A0D4,true},
+ {0x2054,false},{0x1A054,false} // RING_MAX_IDLE (Linux rc6_enable: 10); GDRST resets to 0x40
 };
 uint32_t tglDomainRegisterValues[arrsize(tglDomainRegisters)] {};
 bool tglDomainRegistersRecorded {};
@@ -18496,6 +18575,38 @@ bool tglEngineRegsSerialize(void *,void *,OSSerialize *serializer) {
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 
+// Live RC6 readout (schema 1): {schema, valid, hangs, uptime ns lo, live[16],
+// hang records [8][pre,post][16]}. Same no-forcewake reads as TGLEngineRegsLive.
+// Schema 2 appends, sampled BEFORE this readout takes forcewake: the donor's
+// per-domain forcewake reference counts (IntelAccelerator+0x1290, 4-byte slots,
+// incrementForceWakeCount), the forcewake request/ack registers (GT A188/130044,
+// render A278/D84, media A540/D50, A560/D70) and RCS/CCS PSMI_CTL 2050/1A050.
+// A count or request left held after a GPU restart keeps the GT out of RC6.
+constexpr uint32_t tglRC6WakeRegs[8] {0xA188,0x130044,0xA278,0xD84,0xA540,0xD50,0xA560,0xD70};
+bool tglRC6Serialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[4+16+8*2*16+6+8+2] {2};
+ auto extra=out+4+16+8*2*16;
+ auto &e=tglCSBEngines[0];
+ if (e.streamer && e.hardwareReady) {
+  TGLCSBIO io(e.streamer,0);
+  if (io.owner && io.bar) {
+   for (unsigned i=0;i<6;++i) extra[i]=*reinterpret_cast<volatile uint32_t *>(io.owner+0x1290+4*i);
+   for (unsigned i=0;i<8;++i) extra[6+i]=*reinterpret_cast<volatile uint32_t *>(io.bar+tglRC6WakeRegs[i]);
+  }
+  io.acquire();
+  if (io.bar) {
+   extra[14]=*reinterpret_cast<volatile uint32_t *>(io.bar+0x2050);
+   extra[15]=*reinterpret_cast<volatile uint32_t *>(io.bar+0x1A050);
+   tglRC6Sample(io.bar,out+4);out[1]=1;
+   uint64_t t;clock_get_uptime(&t);uint64_t ns;absolutetime_to_nanoseconds(t,&ns);out[3]=static_cast<uint32_t>(ns/1000);
+  }
+ }
+ out[2]=__atomic_load_n(&tglHangCount,__ATOMIC_ACQUIRE);
+ memcpy(out+20,tglHangRC6,sizeof(tglHangRC6));
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
 // IOAcceleratorFamily2 fence machine entry and IOAccelCommandQueue metaclass, for
 // tglFailChannel. Resolved when that kext loads; absent symbols disable marking only.
 void wexResolveAccelFence(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -18595,6 +18706,7 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   auto data=OSSerializer::forTarget(nullptr,tglCSBSerialize);
   if (data) {root->setProperty("TGLCSB12Live",data);data->release();}
   if (auto regs=OSSerializer::forTarget(nullptr,tglEngineRegsSerialize)) {root->setProperty("TGLEngineRegsLive",regs);regs->release();}
+  if (auto rc6=OSSerializer::forTarget(nullptr,tglRC6Serialize)) {root->setProperty("TGLRC6Live",rc6);rc6->release();}
   if (auto snap=OSSerializer::forTarget(nullptr,tglCSBSnapSerialize)) {root->setProperty("TGLCSBResetSnap",snap);snap->release();}
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
   if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}

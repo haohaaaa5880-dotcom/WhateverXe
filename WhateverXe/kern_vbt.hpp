@@ -264,6 +264,10 @@ inline Ports parse(const void *data,size_t length,Family family,const uint8_t *i
             // Identical wire records carry no competing ownership. Preserve
             // every byte (including the native handle) when deciding equality.
             if(!memcmp(records[d],c,stride))continue;
+            // MSI Thin 15 (#182, small-jp): an eDP panel child followed by a non-panel
+            // DP/HDMI child on the same DDI. Keep the panel (i915 keeps the first
+            // child). A second PANEL record that differs stays a Conflict.
+            if((u16(records[d]+2)&0x1004)==0x1004 && (type&0x1004)!=0x1004)continue;
             r.status=Status::Conflict;return r;
         }
         records[d]=c;if((type&0x1004)==0x1004)panelHandle=u16(c);

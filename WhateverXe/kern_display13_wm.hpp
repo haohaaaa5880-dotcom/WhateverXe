@@ -286,12 +286,15 @@ inline TriggerSurfaces triggerSurfaces(const TriggerPacket *packets,uint32_t cou
 // These linear RGB/cursor WM and PIPE_WM_LINETIME equations do not consume
 // CDCLK. An unchanged hardware-verified plan is valid at another clock when
 // every consumer still fits its bandwidth. A clock request alone is no proof.
+// nativeHz is 2 x CDCLK. Display 10+ processes two pixels per CDCLK cycle
+// (i915 intel_pixel_rate_to_cdclk: DIV_ROUND_UP(pixel_rate, 2)), so a pixel
+// rate up to nativeHz fits (#182 small-jp: 342.06 MHz on 179.2 MHz CDCLK).
 inline bool clockFits(const Snapshot &s,uint64_t nativeHz) {
     return s.primary && s.primary->status==Status::Complete && nativeHz &&
-        s.primary->pixelHz && s.primary->pixelHz<=nativeHz/2 && s.pipePixelHz &&
-        s.pipePixelHz<=nativeHz/2 && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
+        s.primary->pixelHz && s.primary->pixelHz<=nativeHz && s.pipePixelHz &&
+        s.pipePixelHz<=nativeHz && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
         (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete &&
-            s.cursor->pixelHz && s.cursor->pixelHz<=nativeHz/2));
+            s.cursor->pixelHz && s.cursor->pixelHz<=nativeHz));
 }
 enum class LatchCheck : uint32_t {None,Controls,OtherPlane,DSB,Clock,Registers,Live,Frame,AwaitingScanout,AwaitingFlip};
 struct Latch {
